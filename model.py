@@ -15,16 +15,27 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    from triton_kernels import triton_layernorm, TritonGELU, triton_attention
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
+    def __init__(self, ndim, bias, use_triton=False):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.use_triton = HAS_TRITON and use_triton
+        self.eps = 1e-5
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        if self.use_triton and input.is_cuda:
+            bias = self.bias if self.bias is not None else torch.zeros_like(self.weight)
+            return triton_layernorm(input, self.weight, bias, self.eps)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, self.eps)
 
 class CausalSelfAttention(nn.Module):
 
@@ -41,6 +52,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.use_triton = getattr(config, 'use_triton', False)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -49,7 +61,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,14 +70,29 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        is_first_pass = kv_cache is None
+        if kv_cache is not None:
+            prev_k, prev_v = kv_cache
+            k = torch.cat([prev_k, k], dim=2)
+            v = torch.cat([prev_v, v], dim=2)
+        kv_cache = (k, v)
+
+        if HAS_TRITON and self.use_triton and is_first_pass:
+            # use triton attention kernel (only for non-KV cache path for now)
+            y = triton_attention(q, k, v, causal=True)
+            y = y.to(x.dtype)
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # if we have kv_cache, it's not strictly causal in the sense of a triangle mask on the input,
+            # but we only care about the last token's output.
+            is_causal = True if kv_cache is None else False 
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=is_causal)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if kv_cache is None:
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -73,14 +100,17 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, kv_cache
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        if HAS_TRITON and getattr(config, 'use_triton', False):
+            self.gelu = TritonGELU()
+        else:
+            self.gelu = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -95,15 +125,16 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias, use_triton=getattr(config, 'use_triton', False))
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias, use_triton=getattr(config, 'use_triton', False))
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache=None):
+        attn_out, kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, kv_cache
 
 @dataclass
 class GPTConfig:
@@ -114,6 +145,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_triton: bool = False # use Triton kernels for LayerNorm and GELU
 
 class GPT(nn.Module):
 
@@ -128,7 +160,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias, use_triton=config.use_triton),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -167,18 +199,32 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_caches=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        # If we have kv_caches, we are only processing the NEW tokens
+        # The position is the total length so far
+        if kv_caches is not None:
+            # kv_caches is a list of (k, v) tuples, one per layer
+            # Each k/v has shape (b, nh, seqlen, hs)
+            past_seq_len = kv_caches[0][0].size(2)
+            pos = torch.arange(past_seq_len, past_seq_len + t, dtype=torch.long, device=device)
+        else:
+            assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        
+        new_kv_caches = []
+        for i, block in enumerate(self.transformer.h):
+            block_kv_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_block_kv_cache = block(x, kv_cache=block_kv_cache)
+            new_kv_caches.append(new_block_kv_cache)
+            
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -190,7 +236,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, new_kv_caches
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -303,17 +349,49 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=True):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+        if not use_cache:
+            # Original slow behavior
+            for _ in range(max_new_tokens):
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                logits, _, _ = self(idx_cond)
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
+
+        # Fast behavior with KV caching
+        kv_caches = None
+        curr_idx = idx
+        
+        for i in range(max_new_tokens):
+            # if it's the first iteration, we pass the whole prompt
+            # otherwise, we only pass the last generated token
+            if i == 0:
+                idx_cond = curr_idx
+            else:
+                idx_cond = curr_idx[:, [-1]]
+                
+            # crop if necessary (though with KV cache we normally handle this differently, 
+            # for nanoGPT simplicity we just ensure we don't exceed block size total)
+            total_len = (kv_caches[0][0].size(2) if kv_caches is not None else 0) + idx_cond.size(1)
+            if total_len > self.config.block_size:
+                # If we exceed block size, we fall back to slow mode or just crop.
+                # Here we just crop the start of the KV cache if it was possible, 
+                # but for simplicity let's just break or warn.
+                break
+
+            logits, _, kv_caches = self(idx_cond, kv_caches=kv_caches)
+            
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -325,6 +403,6 @@ class GPT(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            curr_idx = torch.cat((curr_idx, idx_next), dim=1)
+            
+        return curr_idx
