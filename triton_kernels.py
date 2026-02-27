@@ -5,63 +5,101 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def layernorm_kernel(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    B,  # pointer to the biases
-    M,  # pointer to the mean
-    V,  # pointer to the variance
-    stride,  # how much to advance one row of X
-    N,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
+def layernorm_residual_kernel(
+    X,      # Pointer to input
+    Res,    # Pointer to residual
+    Y,      # Pointer to normalized output
+    SumOut, # Pointer to sum (X + Res)
+    W, B, M, V,
+    stride, N, eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Map the program id to the row of X and Y it should compute.
+    row = tl.program_id(0)
+    X += row * stride
+    Res += row * stride
+    Y += row * stride
+    SumOut += row * stride
+    
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    
+    # Load input and residual
+    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    res = tl.load(Res + cols, mask=mask, other=0.0).to(tl.float32)
+    
+    # Fused Add
+    x_sum = x + res
+    # Store the sum back if needed (or we can just work with it)
+    tl.store(SumOut + cols, x_sum, mask=mask)
+    
+    # Standard LayerNorm on the sum
+    mean = tl.sum(x_sum, axis=0) / N
+    x_zm = tl.where(mask, x_sum - mean, 0.0)
+    var = tl.sum(x_zm * x_zm, axis=0) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    
+    # Optional: store mean/rstd if needed for training (not for inference)
+    
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    b = tl.load(B + cols, mask=mask).to(tl.float32)
+    y = x_zm * rstd * w + b
+    
+    tl.store(Y + cols, y, mask=mask)
+
+def triton_layernorm_residual(x, residual, weight, bias, eps):
+    x_shape = x.shape
+    x = x.view(-1, x_shape[-1])
+    residual = residual.view(-1, x_shape[-1])
+    M, N = x.shape
+    
+    y = torch.empty_like(x)
+    x_sum = torch.empty_like(x)
+    
+    mean = torch.empty((M, ), dtype=torch.float32, device='cuda')
+    rstd = torch.empty((M, ), dtype=torch.float32, device='cuda')
+    
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    num_warps = 4
+    if BLOCK_SIZE >= 2048: num_warps = 8
+    
+    layernorm_residual_kernel[(M, )](
+        x, residual, y, x_sum, weight, bias, mean, rstd,
+        x.stride(0), N, eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return x_sum.view(*x_shape), y.view(*x_shape)
+
+@triton.jit
+def layernorm_kernel(
+    X, Y, W, B, M, V,
+    stride, N, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
     row = tl.program_id(0)
     Y += row * stride
     X += row * stride
-    # Compute mean
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
     x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
     mean = tl.sum(x, axis=0) / N
     x_zm = tl.where(mask, x - mean, 0.0)
-    # Compute variance
     var = tl.sum(x_zm * x_zm, axis=0) / N
     rstd = 1.0 / tl.sqrt(var + eps)
-    # Write mean and variance
-    tl.store(M + row, mean)
-    tl.store(V + row, rstd)
-    # Normalize and apply scale and shift
     w = tl.load(W + cols, mask=mask).to(tl.float32)
     b = tl.load(B + cols, mask=mask).to(tl.float32)
     y = x_zm * rstd * w + b
-    # Write output
     tl.store(Y + cols, y, mask=mask)
 
 def triton_layernorm(x, weight, bias, eps):
-    # reshape input data into 2D tensor
     x_shape = x.shape
     x = x.view(-1, x_shape[-1])
     M, N = x.shape
     y = torch.empty_like(x)
-    reshape = False
-    if M == 1:
-        # triton handles this well
-        pass
-    
-    # pointers to mean and variance
     mean = torch.empty((M, ), dtype=torch.float32, device='cuda')
     rstd = torch.empty((M, ), dtype=torch.float32, device='cuda')
-    
-    # Less than 64KB per feature row is typical for LayerNorm
     BLOCK_SIZE = triton.next_power_of_2(N)
-    
     num_warps = 4
-    if BLOCK_SIZE >= 2048: num_warps = 8
-    if BLOCK_SIZE >= 4096: num_warps = 16
-    
     layernorm_kernel[(M, )](
         x, y, weight, bias, mean, rstd,
         x.stride(0), N, eps,
@@ -72,32 +110,91 @@ def triton_layernorm(x, weight, bias, eps):
 
 @triton.jit
 def gelu_kernel(
-    x_ptr,
-    y_ptr,
-    n_elements,
+    x_ptr, y_ptr, n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
-    
-    # GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     y = 0.5 * x * (1.0 + tl.math.erf(x * 0.70710678118))
-    
-    tl.store(y_ptr + offsets, y, mask=mask)
+    tl.store(y_ptr + offsets, y.to(tl.float16), mask=mask)
 
 def triton_gelu(x):
     n_elements = x.numel()
     y = torch.empty_like(x)
     BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    gelu_kernel[grid](
-        x, y, n_elements,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    gelu_kernel[grid](x, y, n_elements, BLOCK_SIZE=BLOCK_SIZE)
     return y
+
+@triton.jit
+def layernorm_gelu_kernel(
+    X, Y, W, B,
+    stride, N, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    X += row * stride
+    Y += row * stride
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    
+    # Load and normalize
+    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(x, axis=0) / N
+    x_zm = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(x_zm * x_zm, axis=0) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    b = tl.load(B + cols, mask=mask).to(tl.float32)
+    y_norm = x_zm * rstd * w + b
+    
+    # Apply GELU (Approximate)
+    y = 0.5 * y_norm * (1.0 + tl.math.erf(y_norm * 0.70710678118))
+    
+    tl.store(Y + cols, y.to(tl.float16), mask=mask)
+
+def triton_layernorm_gelu(x, weight, bias, eps):
+    x_shape = x.shape
+    x = x.view(-1, x_shape[-1])
+    M, N = x.shape
+    y = torch.empty_like(x)
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    layernorm_gelu_kernel[(M, )](
+        x, y, weight, bias,
+        x.stride(0), N, eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+    )
+    return y.view(*x_shape)
+
+@triton.jit
+def gelu_bias_kernel(
+    x_ptr, bias_ptr, y_ptr,
+    M, N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    x_ptr += row * N
+    y_ptr += row * N
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    x += bias
+    y = 0.5 * x * (1.0 + tl.math.erf(x * 0.70710678118))
+    tl.store(y_ptr + cols, y.to(tl.float16), mask=mask)
+
+def triton_gelu_bias(x, bias):
+    x_shape = x.shape
+    x = x.view(-1, x_shape[-1])
+    M, N = x.shape
+    y = torch.empty_like(x)
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    gelu_bias_kernel[(M,)](x, bias, y, M, N, BLOCK_SIZE=BLOCK_SIZE)
+    return y.view(*x_shape)
 
 class TritonLayerNorm(torch.nn.Module):
     def __init__(self, ndim, bias, eps=1e-5):
@@ -113,6 +210,21 @@ class TritonLayerNorm(torch.nn.Module):
         # If bias is None, we need to pass a zero tensor to the kernel (or modify kernel)
         bias = self.bias if self.bias is not None else torch.zeros_like(self.weight)
         return triton_layernorm(x, self.weight, bias, self.eps)
+
+class TritonLayerNormGELU(torch.nn.Module):
+    def __init__(self, ndim, bias, eps=1e-5):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(ndim))
+        self.bias = torch.nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+
+    def forward(self, x):
+        if not x.is_cuda:
+            y = torch.nn.functional.layer_norm(x, self.weight.shape, self.weight, self.bias, self.eps)
+            return torch.nn.functional.gelu(y)
+        
+        bias = self.bias if self.bias is not None else torch.zeros_like(self.weight)
+        return triton_layernorm_gelu(x, self.weight, bias, self.eps)
 
 class TritonGELU(torch.nn.Module):
     def forward(self, x):
@@ -142,8 +254,12 @@ def _attn_fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D_HEAD)
 
+    # batch and head index
+    batch_idx = off_hz // H
+    head_idx = off_hz % H
+
     # load Q
-    curr_q_ptr = Q + off_hz * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    curr_q_ptr = Q + batch_idx * stride_qz + head_idx * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q = tl.load(curr_q_ptr, mask=offs_m[:, None] < N_CTX, other=0.0)
 
     # initialize L and M
@@ -154,7 +270,7 @@ def _attn_fwd_kernel(
     # iterate over K, V
     for start_n in range(0, (start_m + 1) * BLOCK_M, BLOCK_N):
         # load K
-        curr_k_ptr = K + off_hz * stride_kh + (start_n + offs_n)[None, :] * stride_kn + offs_d[:, None] * stride_kk
+        curr_k_ptr = K + batch_idx * stride_kz + head_idx * stride_kh + (start_n + offs_n)[None, :] * stride_kn + offs_d[:, None] * stride_kk
         k = tl.load(curr_k_ptr, mask=(start_n + offs_n)[None, :] < N_CTX, other=0.0)
         # compute qk
         qk = tl.dot(q, k)
@@ -180,7 +296,7 @@ def _attn_fwd_kernel(
         
         acc = acc * alpha[:, None]
         # load V
-        curr_v_ptr = V + off_hz * stride_vh + (start_n + offs_n)[:, None] * stride_vk + offs_d[None, :] * stride_vn
+        curr_v_ptr = V + batch_idx * stride_vz + head_idx * stride_vh + (start_n + offs_n)[:, None] * stride_vk + offs_d[None, :] * stride_vn
         v = tl.load(curr_v_ptr, mask=(start_n + offs_n)[:, None] < N_CTX, other=0.0)
         acc += tl.dot(p.to(tl.float16), v.to(tl.float16)) * beta[:, None]
         d_i = d_i * alpha + l_ij * beta
@@ -192,7 +308,7 @@ def _attn_fwd_kernel(
     # mask out rows that are purely padding
     acc = tl.where(offs_m[:, None] < N_CTX, acc, 0.0)
     
-    curr_o_ptr = Out + off_hz * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
+    curr_o_ptr = Out + batch_idx * stride_oz + head_idx * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
     tl.store(curr_o_ptr, acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
 
 def triton_attention(q, k, v, causal=True):

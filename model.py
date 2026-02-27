@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 try:
-    from triton_kernels import triton_layernorm, TritonGELU, triton_attention
+    from triton_kernels import triton_layernorm, triton_layernorm_residual, TritonGELU, triton_gelu_bias, triton_attention
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -113,10 +113,17 @@ class MLP(nn.Module):
             self.gelu = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
+        self.use_triton = HAS_TRITON and getattr(config, 'use_triton', False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
+        if self.use_triton and x.is_cuda and self.c_fc.bias is not None:
+            # Fused Bias + GELU
+            # We must use F.linear with weight only, then apply fused bias/gelu
+            x = F.linear(x, self.c_fc.weight)
+            x = triton_gelu_bias(x, self.c_fc.bias)
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -132,8 +139,16 @@ class Block(nn.Module):
 
     def forward(self, x, kv_cache=None):
         attn_out, kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
-        x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
+        
+        # Fused Residual + LayerNorm
+        if HAS_TRITON and self.ln_2.use_triton and x.is_cuda:
+            bias = self.ln_2.bias if self.ln_2.bias is not None else torch.zeros_like(self.ln_2.weight)
+            x, ln_2_x = triton_layernorm_residual(x, attn_out, self.ln_2.weight, bias, self.ln_2.eps)
+        else:
+            x = x + attn_out
+            ln_2_x = self.ln_2(x)
+            
+        x = x + self.mlp(ln_2_x)
         return x, kv_cache
 
 @dataclass
@@ -279,6 +294,7 @@ class GPT(nn.Module):
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        print(f"sd_keys: {sd_keys}")
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -288,6 +304,7 @@ class GPT(nn.Module):
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        print(f"sd_keys_hf: {sd_keys_hf}")
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
