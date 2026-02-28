@@ -23,9 +23,13 @@ gradient_accumulation_steps = 4
 dropout = 0.0  # no dropout when finetuning from pretrained
 
 # Training
-max_iters      = 20000
-eval_interval  = 500
-warmup_iters   = 100
-learning_rate  = 3e-5
-min_lr         = 3e-6
-lr_decay_iters = 20000
+max_iters        = 20000
+eval_interval    = 500
+warmup_iters     = 100
+learning_rate    = 3e-5
+min_lr           = 3e-6
+lr_scheduler     = 'cosine_restarts'
+lr_restart_period = 2000   # first cycle: 2000 iters
+lr_restart_mult   = 2      # each restart doubles the cycle length (2000→4000→8000...)
+lr_restart_decay  = 0.75   # peak LR: 3e-5 → 2.25e-5 → 1.69e-5 → ...
+lr_decay_iters   = 20000   # unused by cosine_restarts but kept for compatibility

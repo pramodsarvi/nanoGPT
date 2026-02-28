@@ -70,8 +70,15 @@ beta2 = 0.95
 grad_clip = 1.0
 # learning rate decay settings
 decay_lr = True
+lr_scheduler = 'cosine'         # 'cosine' | 'cosine_restarts' | 'cyclic_triangular2'
 warmup_iters = 2000
 lr_decay_iters = 600000
+# cosine_restarts params
+lr_restart_period = 2000        # iters per cosine restart cycle (T_0)
+lr_restart_mult   = 2           # cycle length multiplier after each restart (T_mult)
+lr_restart_decay  = 0.75        # peak LR multiplier per restart (1.0=no decay, 0.5=halve each time)
+# cyclic_triangular2 params
+lr_cycle_size     = 2000        # iters per half-cycle (step_size_up)
 min_lr = 6e-5
 # system
 backend = 'nccl'
@@ -371,13 +378,43 @@ def estimate_loss():
 
 # learning rate decay scheduler
 def get_lr(it):
+    # linear warmup shared by all schedulers
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    if it > lr_decay_iters:
-        return min_lr
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (learning_rate - min_lr)
+
+    if lr_scheduler == 'cosine':
+        # single cosine decay: learning_rate → min_lr over lr_decay_iters
+        if it > lr_decay_iters:
+            return min_lr
+        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (learning_rate - min_lr)
+
+    elif lr_scheduler == 'cosine_restarts':
+        # CosineAnnealingWarmRestarts with decaying peaks (lower highs each restart)
+        # T_0=lr_restart_period, T_mult=lr_restart_mult, peak decay=lr_restart_decay
+        t = it - warmup_iters
+        T_cur = lr_restart_period
+        cycle = 0
+        while t >= T_cur:
+            t -= T_cur
+            T_cur = int(T_cur * lr_restart_mult)
+            cycle += 1
+        peak_lr = learning_rate * (lr_restart_decay ** cycle)  # lower high each cycle
+        peak_lr = max(peak_lr, min_lr)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * t / T_cur))
+        return min_lr + coeff * (peak_lr - min_lr)
+
+    elif lr_scheduler == 'cyclic_triangular2':
+        # CyclicLR triangular2: triangular cycles with amplitude halving each cycle
+        # step_size = lr_cycle_size (half-cycle length)
+        t = it - warmup_iters
+        cycle = t // (2 * lr_cycle_size)
+        x = abs(t / lr_cycle_size - 2 * cycle - 1)
+        scale = 1.0 / (2 ** cycle)   # halve amplitude each full cycle
+        return min_lr + (learning_rate - min_lr) * max(0, 1 - x) * scale
+
+    return min_lr
 
 # logging
 if wandb_log and master_process:
