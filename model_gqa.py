@@ -151,7 +151,7 @@ class GQACausalSelfAttention(nn.Module):
                       .view(1, 1, config.block_size, config.block_size)
             )
 
-    def forward(self, x, rope: RotaryEmbedding, kv_cache=None):
+    def forward(self, x, rope: Optional[RotaryEmbedding], kv_cache=None):
         B, T, C = x.size()
 
         # Q: (B, n_head, T, hs)
@@ -163,12 +163,12 @@ class GQACausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)   # (B, n_kv_head, T, hs)
         v = v.transpose(1, 2)   # (B, n_kv_head, T, hs)
 
-        # RoPE: apply to Q and K with correct position offset
-        # offset = how many tokens are already in the KV cache
-        offset = kv_cache[0].size(2) if kv_cache is not None else 0
-        cos, sin = rope.get_cos_sin(T, offset=offset, device=x.device)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        # RoPE: apply to Q and K (only when use_rope=True)
+        if rope is not None:
+            offset = kv_cache[0].size(2) if kv_cache is not None else 0
+            cos, sin = rope.get_cos_sin(T, offset=offset, device=x.device)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
 
         # Append to KV cache
         is_first_pass = kv_cache is None
@@ -266,6 +266,7 @@ class GPTConfigGQA:
     bias:        bool  = True
     use_triton:  bool  = False
     rope_base:   int   = 10000   # RoPE frequency base (10000 = original, 500000 = LLaMA 3)
+    use_rope:    bool  = True    # False = use learned absolute PE (compatible with GPT-2 pretrained weights)
 
 
 class GPTGQA(nn.Module):
@@ -280,14 +281,17 @@ class GPTGQA(nn.Module):
 
         head_dim = config.n_embd // config.n_head
 
-        self.transformer = nn.ModuleDict(dict(
+        transformer_dict = dict(
             wte  = nn.Embedding(config.vocab_size, config.n_embd),
-            # No wpe — RoPE replaces learned position embeddings
-            rope = RotaryEmbedding(head_dim, config.block_size, base=config.rope_base),
             drop = nn.Dropout(config.dropout),
             h    = nn.ModuleList([BlockGQA(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias, use_triton=config.use_triton),
-        ))
+        )
+        if config.use_rope:
+            transformer_dict['rope'] = RotaryEmbedding(head_dim, config.block_size, base=config.rope_base)
+        else:
+            transformer_dict['wpe'] = nn.Embedding(config.block_size, config.n_embd)
+        self.transformer = nn.ModuleDict(transformer_dict)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # weight tying
 
@@ -327,10 +331,16 @@ class GPTGQA(nn.Module):
         assert t <= self.config.block_size, \
             f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        # Token embeddings only — RoPE is applied inside each attention layer
-        x = self.transformer.drop(self.transformer.wte(idx))  # (B, T, C)
-
-        rope = self.transformer.rope
+        # Token + position embeddings
+        tok_emb = self.transformer.wte(idx)  # (B, T, C)
+        if self.config.use_rope:
+            x = self.transformer.drop(tok_emb)
+            rope = self.transformer.rope
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+            pos_emb = self.transformer.wpe(pos)  # (T, C)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            rope = None
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
             block_kv_cache = kv_caches[i] if kv_caches is not None else None
@@ -509,12 +519,17 @@ class GPTGQA(nn.Module):
                             f"Shape mismatch for {gqa_key}: {gqa_sd[gqa_key].shape} vs {mha_sd[gqa_key].shape}"
                         gqa_sd[gqa_key].copy_(mha_sd[gqa_key])
                         copied += 1
+                    elif gqa_key == 'transformer.wpe.weight' and 'transformer.wpe.weight' in mha_sd:
+                        # use_rope=False: copy absolute PE from MHA checkpoint
+                        gqa_sd[gqa_key].copy_(mha_sd['transformer.wpe.weight'])
+                        copied += 1
                     else:
-                        # wpe and RoPE buffers won't be in mha_sd — expected
+                        # RoPE buffers or wpe (when use_rope=True) — expected to be absent
                         skipped += 1
 
         model.load_state_dict(gqa_sd)
-        print(f"  Loaded: {copied} tensors copied, {skipped} skipped (wpe discarded, RoPE has no weights).")
+        pe_desc = "absolute PE copied from MHA" if not config.use_rope else "RoPE (no weights to copy)"
+        print(f"  Loaded: {copied} tensors copied, {skipped} skipped. PE: {pe_desc}")
         print(f"  MHA n_head={config.n_head} -> GQA n_kv_head={config.n_kv_head} "
               f"(kept first {config.n_kv_head} of {config.n_head} KV heads per layer)")
         return model, checkpoint.get('iter_num', 0), checkpoint.get('best_val_loss', 1e9)
