@@ -12,6 +12,8 @@ import time
 import math
 import pickle
 import functools
+import threading
+import queue
 from contextlib import nullcontext
 
 import numpy as np
@@ -147,12 +149,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 #      streams train AND val directly from HF — zero local disk needed
 data_dir = os.path.join('data', dataset.split(':')[-1].split('/')[-1]) if dataset.startswith('hf:') else os.path.join('data', dataset)
 
-# --- HuggingFace streaming iterators (train + val) ---
-_hf_train_buf = []
-_hf_val_buf   = []
-_hf_train_iter = None
-_hf_val_iter   = None
-_HF_VAL_SKIP   = 5000  # skip first N docs for val (same split as prepare.py)
+# --- HuggingFace streaming iterators with prefetch ---
+_HF_VAL_SKIP    = 5000  # skip first N docs for val (same split as prepare.py)
+_HF_PREFETCH_Q  = 4     # number of batches to prefetch ahead
 
 def _make_hf_iter(skip_docs=0):
     import tiktoken
@@ -174,41 +173,50 @@ def _make_hf_iter(skip_docs=0):
             yield from ids
     return _token_gen()
 
-def _hf_fill_buf(buf, it, needed):
-    while len(buf) < needed:
-        try:
-            buf.append(next(it))
-        except StopIteration:
-            return False  # exhausted
-    return True
+class _HFPrefetcher:
+    """Fills a queue with pre-tokenized CPU tensors in a background thread."""
+    def __init__(self, split):
+        self.split = split
+        self.q = queue.Queue(maxsize=_HF_PREFETCH_Q)
+        self._stop = threading.Event()
+        self._buf = []
+        self._it = _make_hf_iter(skip_docs=0 if split == 'val' else _HF_VAL_SKIP)
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _fill(self, needed):
+        while len(self._buf) < needed:
+            try:
+                self._buf.append(next(self._it))
+            except StopIteration:
+                # restart iterator on exhaustion
+                self._it = _make_hf_iter(skip_docs=0 if self.split == 'val' else _HF_VAL_SKIP)
+
+    def _worker(self):
+        needed = batch_size * (block_size + 1)
+        while not self._stop.is_set():
+            self._fill(needed)
+            tokens = torch.tensor(self._buf[:needed], dtype=torch.long)
+            del self._buf[:batch_size * block_size]
+            tokens = tokens.view(batch_size, block_size + 1)
+            x = tokens[:, :-1]  # CPU tensor — .to(device) done in main thread
+            y = tokens[:, 1:]
+            self.q.put((x, y))  # blocks if queue is full (natural backpressure)
+
+    def next_batch(self):
+        x, y = self.q.get()
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+    def stop(self):
+        self._stop.set()
+
+_hf_prefetchers = {}  # keyed by split, initialized lazily
 
 def _hf_get_batch(split):
-    global _hf_train_buf, _hf_val_buf, _hf_train_iter, _hf_val_iter
-    if split == 'train':
-        if _hf_train_iter is None:
-            _hf_train_iter = _make_hf_iter(skip_docs=_HF_VAL_SKIP)
-        buf, it = _hf_train_buf, _hf_train_iter
-    else:
-        if _hf_val_iter is None:
-            _hf_val_iter = _make_hf_iter(skip_docs=0)  # val = first N docs
-        buf, it = _hf_val_buf, _hf_val_iter
-
-    needed = batch_size * (block_size + 1)
-    if not _hf_fill_buf(buf, it, needed):
-        # restart on exhaustion
-        if split == 'train':
-            _hf_train_iter = _make_hf_iter(skip_docs=_HF_VAL_SKIP)
-            _hf_fill_buf(buf, _hf_train_iter, needed)
-        else:
-            _hf_val_iter = _make_hf_iter(skip_docs=0)
-            _hf_fill_buf(buf, _hf_val_iter, needed)
-
-    tokens = torch.tensor(buf[:needed], dtype=torch.long)
-    del buf[:batch_size * block_size]  # slide forward by one batch
-    tokens = tokens.view(batch_size, block_size + 1)
-    x = tokens[:, :-1].to(device, non_blocking=True)
-    y = tokens[:, 1:].to(device, non_blocking=True)
-    return x, y
+    global _hf_prefetchers
+    if split not in _hf_prefetchers:
+        _hf_prefetchers[split] = _HFPrefetcher(split)
+    return _hf_prefetchers[split].next_batch()
 
 def get_batch(split):
     if dataset.startswith('hf:'):
