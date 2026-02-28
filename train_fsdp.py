@@ -207,6 +207,25 @@ elif init_from == 'mha_to_gqa':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(ckpt_path, n_kv_head=_n_kv_head)
 
+elif init_from.startswith('gpt2'):
+    # Load pretrained GPT-2 weights from HuggingFace
+    # Supports: 'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'
+    # With n_kv_head > 0, converts MHA → GQA after loading
+    hf_model_name = init_from.replace('_to_gqa', '')  # 'gpt2_to_gqa' -> 'gpt2'
+    print(f"Loading pretrained weights from HuggingFace: {hf_model_name}")
+    mha_model = GPT.from_pretrained(hf_model_name, override_args=dict(dropout=dropout))
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(mha_model.config, k)
+    if use_gqa:
+        # Save MHA checkpoint temporarily, then convert to GQA
+        tmp_ckpt = os.path.join(out_dir, 'tmp_mha_pretrained.pt')
+        os.makedirs(out_dir, exist_ok=True)
+        torch.save({'model': mha_model.state_dict(), 'model_args': vars(mha_model.config)}, tmp_ckpt)
+        model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(tmp_ckpt, n_kv_head=_n_kv_head)
+        os.remove(tmp_ckpt)
+    else:
+        model = mha_model
+
 # crop block size if needed
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -258,7 +277,7 @@ else:
 # compile the model AFTER FSDP wrapping
 if compile:
     print("compiling the model... (takes a ~minute)")
-    model = torch.compile(model)
+    model = torch.compile(model, mode='reduce-overhead')
 
 # helps estimate an arbitrarily accurate loss
 @torch.no_grad()

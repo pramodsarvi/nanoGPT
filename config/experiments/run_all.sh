@@ -4,10 +4,16 @@
 #
 # Usage: bash config/experiments/run_all.sh
 # Or run individual ones:
-#   ~/venv/bin/python train_fsdp.py config/experiments/exp01_mha_abspe.py
+#   python3 train_fsdp.py config/experiments/exp01_mha_abspe.py
 
 set -e
-PYTHON=~/venv/bin/python
+PYTHON=$(which python3)
+
+# Prepare data if not already done
+if [ ! -f data/shakespeare_char/train.bin ]; then
+    echo "Preparing shakespeare_char data..."
+    $PYTHON data/shakespeare_char/prepare.py
+fi
 
 experiments=(
     config/experiments/exp01_mha_abspe.py
@@ -15,6 +21,8 @@ experiments=(
     config/experiments/exp03_gqa3_rope.py
     config/experiments/exp04_mqa_rope.py
     config/experiments/exp05_gqa2_rope500k.py
+    config/experiments/exp06_gpt2_mha_finetune.py
+    config/experiments/exp07_gpt2_gqa2_finetune.py
 )
 
 for cfg in "${experiments[@]}"; do

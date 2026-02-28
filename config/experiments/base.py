@@ -6,17 +6,17 @@
 
 out_dir = 'out_experiments/base'   # overridden per experiment
 dataset = 'shakespeare_char'
-eval_interval = 250
+eval_interval = 500
 log_interval  = 10
-eval_iters    = 50
+eval_iters    = 100
 eval_only     = False
 always_save_checkpoint = False
 
 init_from = 'scratch'
 
-gradient_accumulation_steps = 1
-batch_size  = 16
-block_size  = 256
+gradient_accumulation_steps = 8
+batch_size  = 8
+block_size  = 512
 
 # Model dims — same across all experiments for fair comparison
 n_layer = 6
@@ -26,18 +26,18 @@ dropout = 0.1
 bias    = False
 
 # Optimizer
-learning_rate = 1e-3
-max_iters     = 2000
+learning_rate = 6e-4
+max_iters     = 20000
 weight_decay  = 1e-1
 beta1 = 0.9
-beta2 = 0.99
+beta2 = 0.95
 grad_clip = 1.0
 
 # LR schedule
 decay_lr      = True
-warmup_iters  = 100
-lr_decay_iters = 2000
-min_lr        = 1e-4
+warmup_iters  = 500
+lr_decay_iters = 20000
+min_lr        = 6e-5
 
 # System
 device  = 'cuda'
