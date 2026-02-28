@@ -499,17 +499,29 @@ class GPTGQA(nn.Module):
                         copied += 1
 
                 elif gqa_key.endswith('attn.kv_proj.weight'):
+                    # Mean pooling (GQA paper): average each group of n_groups MHA heads
+                    # into one GQA KV head, preserving all pretrained knowledge.
+                    # Shape: c_attn.weight [3*C, C] → K block [n_head*hd, C], V block [n_head*hd, C]
+                    # Reshape to [n_kv_head, n_groups, hd, C], mean over n_groups dim.
                     mha_key = gqa_key.replace('attn.kv_proj.weight', 'attn.c_attn.weight')
-                    k_w = mha_sd[mha_key][config.n_embd           : config.n_embd + kv_dim, :]
-                    v_w = mha_sd[mha_key][config.n_embd * 2       : config.n_embd * 2 + kv_dim, :]
+                    n_groups = config.n_head // config.n_kv_head
+                    k_all = mha_sd[mha_key][config.n_embd : config.n_embd * 2, :]          # [n_head*hd, C]
+                    v_all = mha_sd[mha_key][config.n_embd * 2 : config.n_embd * 3, :]     # [n_head*hd, C]
+                    k_w = k_all.view(config.n_kv_head, n_groups, head_dim, config.n_embd).mean(dim=1)  # [n_kv_head, hd, C]
+                    v_w = v_all.view(config.n_kv_head, n_groups, head_dim, config.n_embd).mean(dim=1)
+                    k_w = k_w.reshape(kv_dim, config.n_embd)
+                    v_w = v_w.reshape(kv_dim, config.n_embd)
                     gqa_sd[gqa_key].copy_(torch.cat([k_w, v_w], dim=0))
                     copied += 1
 
                 elif gqa_key.endswith('attn.kv_proj.bias'):
                     mha_key = gqa_key.replace('attn.kv_proj.bias', 'attn.c_attn.bias')
                     if mha_key in mha_sd:
-                        k_b = mha_sd[mha_key][config.n_embd     : config.n_embd + kv_dim]
-                        v_b = mha_sd[mha_key][config.n_embd * 2 : config.n_embd * 2 + kv_dim]
+                        n_groups = config.n_head // config.n_kv_head
+                        k_all = mha_sd[mha_key][config.n_embd : config.n_embd * 2]        # [n_head*hd]
+                        v_all = mha_sd[mha_key][config.n_embd * 2 : config.n_embd * 3]   # [n_head*hd]
+                        k_b = k_all.view(config.n_kv_head, n_groups, head_dim).mean(dim=1).reshape(kv_dim)
+                        v_b = v_all.view(config.n_kv_head, n_groups, head_dim).mean(dim=1).reshape(kv_dim)
                         gqa_sd[gqa_key].copy_(torch.cat([k_b, v_b], dim=0))
                         copied += 1
 
@@ -531,5 +543,5 @@ class GPTGQA(nn.Module):
         pe_desc = "absolute PE copied from MHA" if not config.use_rope else "RoPE (no weights to copy)"
         print(f"  Loaded: {copied} tensors copied, {skipped} skipped. PE: {pe_desc}")
         print(f"  MHA n_head={config.n_head} -> GQA n_kv_head={config.n_kv_head} "
-              f"(kept first {config.n_kv_head} of {config.n_head} KV heads per layer)")
+              f"(mean pooled {config.n_head//config.n_kv_head} MHA heads per GQA KV head)")
         return model, checkpoint.get('iter_num', 0), checkpoint.get('best_val_loss', 1e9)

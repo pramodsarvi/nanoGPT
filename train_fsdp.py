@@ -282,7 +282,10 @@ elif init_from == 'mha_to_gqa':
     # Load a standard MHA checkpoint and convert to GQA by dropping KV heads
     assert use_gqa, "init_from='mha_to_gqa' requires n_kv_head > 0"
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(ckpt_path, n_kv_head=_n_kv_head)
+    model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(
+        ckpt_path, n_kv_head=_n_kv_head,
+        override_args=dict(dropout=dropout, rope_base=rope_base, use_rope=use_rope),
+    )
 
 elif init_from.startswith('gpt2'):
     # Load pretrained GPT-2 weights from HuggingFace
@@ -298,7 +301,10 @@ elif init_from.startswith('gpt2'):
         tmp_ckpt = os.path.join(out_dir, 'tmp_mha_pretrained.pt')
         os.makedirs(out_dir, exist_ok=True)
         torch.save({'model': mha_model.state_dict(), 'model_args': vars(mha_model.config)}, tmp_ckpt)
-        model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(tmp_ckpt, n_kv_head=_n_kv_head)
+        model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(
+            tmp_ckpt, n_kv_head=_n_kv_head,
+            override_args=dict(dropout=dropout, rope_base=rope_base, use_rope=use_rope),
+        )
         os.remove(tmp_ckpt)
     else:
         model = mha_model
