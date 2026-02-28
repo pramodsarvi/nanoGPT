@@ -15,6 +15,11 @@ if [ ! -f data/shakespeare_char/train.bin ]; then
     $PYTHON data/shakespeare_char/prepare.py
 fi
 
+if [ ! -f data/fineweb_edu/train.bin ]; then
+    echo "Preparing fineweb_edu data (streaming, may take a while)..."
+    $PYTHON data/fineweb_edu/prepare.py
+fi
+
 experiments=(
     config/experiments/exp01_mha_abspe.py
     config/experiments/exp02_gqa2_rope.py

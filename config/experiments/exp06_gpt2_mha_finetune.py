@@ -14,9 +14,12 @@ n_layer = 12
 n_head  = 12
 n_embd  = 768
 block_size = 1024
+batch_size = 8
+gradient_accumulation_steps = 4
 
 # Finetune with lower LR
-learning_rate = 3e-5
-min_lr        = 3e-6
-warmup_iters  = 100
-lr_decay_iters = 20000
+max_iters      = 5000
+learning_rate  = 3e-5
+min_lr         = 3e-6
+warmup_iters   = 100
+lr_decay_iters = 5000

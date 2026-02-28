@@ -1,0 +1,30 @@
+# Experiment 09: Finetune pretrained GPT-2, GQA with 4 KV heads, FineWeb-Edu streaming
+# No local train.bin needed — streams directly from HuggingFace.
+# Only val.bin required (~8MB): python3 data/fineweb_edu/prepare.py --val_only
+#
+# Run: python3 train_fsdp.py config/experiments/exp09_gpt2_gqa4_fineweb_stream.py
+
+exec(open('config/experiments/base.py').read())
+
+out_dir        = 'out_experiments/exp09_gpt2_gqa4_fineweb_stream'
+init_from      = 'gpt2_to_gqa'
+dataset        = 'hf:HuggingFaceFW/fineweb-edu'  # streams from HF, no local train.bin needed
+n_kv_head      = 4              # GQA: 4 KV heads shared across 12 query heads (3 queries per KV)
+wandb_run_name = 'exp09-gpt2-gqa4-fineweb-stream'
+
+# GPT-2 architecture
+n_layer = 12
+n_head  = 12
+n_embd  = 768
+block_size = 1024
+batch_size = 8
+gradient_accumulation_steps = 4
+dropout = 0.0  # no dropout when finetuning from pretrained
+
+# Training
+max_iters      = 5000
+eval_interval  = 500
+warmup_iters   = 100
+learning_rate  = 3e-5
+min_lr         = 3e-6
+lr_decay_iters = 5000
