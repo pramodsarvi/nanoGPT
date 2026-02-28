@@ -136,19 +136,20 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # data loader — two modes:
 #   1. local binary (default): reads from data/<dataset>/train.bin via memmap
 #   2. HuggingFace streaming: set dataset='hf:<repo>/<name>' e.g. 'hf:HuggingFaceFW/fineweb-edu'
-#      streams directly from HF, no local bin file needed for training (val still uses memmap)
+#      streams train AND val directly from HF — zero local disk needed
 data_dir = os.path.join('data', dataset.split(':')[-1].split('/')[-1]) if dataset.startswith('hf:') else os.path.join('data', dataset)
 
-# --- HuggingFace streaming iterator ---
-_hf_token_buffer = []
-_hf_iter = None
+# --- HuggingFace streaming iterators (train + val) ---
+_hf_train_buf = []
+_hf_val_buf   = []
+_hf_train_iter = None
+_hf_val_iter   = None
+_HF_VAL_SKIP   = 5000  # skip first N docs for val (same split as prepare.py)
 
-def _init_hf_stream():
-    global _hf_iter
+def _make_hf_iter(skip_docs=0):
     import tiktoken
     from datasets import load_dataset as _load_dataset
     hf_path = dataset[3:]  # strip 'hf:'
-    # support optional config name via 'hf:repo/name@config'
     if '@' in hf_path:
         hf_path, hf_config = hf_path.split('@', 1)
     else:
@@ -157,34 +158,53 @@ def _init_hf_stream():
     eot = enc.eot_token
     ds = _load_dataset(hf_path, name=hf_config, split='train', streaming=True)
     def _token_gen():
-        for ex in ds:
+        for idx, ex in enumerate(ds):
+            if idx < skip_docs:
+                continue
             ids = enc.encode_ordinary(ex['text'])
             ids.append(eot)
             yield from ids
-    _hf_iter = _token_gen()
+    return _token_gen()
 
-def _hf_get_batch():
-    global _hf_token_buffer, _hf_iter
-    if _hf_iter is None:
-        _init_hf_stream()
-    needed = batch_size * (block_size + 1)
-    while len(_hf_token_buffer) < needed:
+def _hf_fill_buf(buf, it, needed):
+    while len(buf) < needed:
         try:
-            _hf_token_buffer.append(next(_hf_iter))
+            buf.append(next(it))
         except StopIteration:
-            # restart stream from beginning when exhausted
-            _hf_iter = None
-            _init_hf_stream()
-    tokens = torch.tensor(_hf_token_buffer[:needed], dtype=torch.long)
-    _hf_token_buffer = _hf_token_buffer[batch_size * block_size:]  # slide by one batch
+            return False  # exhausted
+    return True
+
+def _hf_get_batch(split):
+    global _hf_train_buf, _hf_val_buf, _hf_train_iter, _hf_val_iter
+    if split == 'train':
+        if _hf_train_iter is None:
+            _hf_train_iter = _make_hf_iter(skip_docs=_HF_VAL_SKIP)
+        buf, it = _hf_train_buf, _hf_train_iter
+    else:
+        if _hf_val_iter is None:
+            _hf_val_iter = _make_hf_iter(skip_docs=0)  # val = first N docs
+        buf, it = _hf_val_buf, _hf_val_iter
+
+    needed = batch_size * (block_size + 1)
+    if not _hf_fill_buf(buf, it, needed):
+        # restart on exhaustion
+        if split == 'train':
+            _hf_train_iter = _make_hf_iter(skip_docs=_HF_VAL_SKIP)
+            _hf_fill_buf(buf, _hf_train_iter, needed)
+        else:
+            _hf_val_iter = _make_hf_iter(skip_docs=0)
+            _hf_fill_buf(buf, _hf_val_iter, needed)
+
+    tokens = torch.tensor(buf[:needed], dtype=torch.long)
+    del buf[:batch_size * block_size]  # slide forward by one batch
     tokens = tokens.view(batch_size, block_size + 1)
     x = tokens[:, :-1].to(device, non_blocking=True)
     y = tokens[:, 1:].to(device, non_blocking=True)
     return x, y
 
 def get_batch(split):
-    if split == 'train' and dataset.startswith('hf:'):
-        return _hf_get_batch()
+    if dataset.startswith('hf:'):
+        return _hf_get_batch(split)
     # local memmap path
     bin_file = 'train.bin' if split == 'train' else 'val.bin'
     data = np.memmap(os.path.join(data_dir, bin_file), dtype=np.uint16, mode='r')
