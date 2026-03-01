@@ -20,10 +20,10 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 32
-gradient_accumulation_steps = 4   # effective batch = 128
+batch_size = 16
+gradient_accumulation_steps = 8   # effective batch = 128
 dropout    = 0.0  # no dropout when finetuning from pretrained
-compile    = True
+compile    = False
 
 # Auto-detect: resume from checkpoint if one exists, else start fresh from GPT-2 Large
 _ckpt = _os.path.join(out_dir, 'ckpt.pt')
