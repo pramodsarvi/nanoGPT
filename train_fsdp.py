@@ -368,7 +368,7 @@ else:
 # compile the model AFTER FSDP wrapping
 if compile:
     print("compiling the model... (takes a ~minute)")
-    model = torch.compile(model, mode='reduce-overhead')
+    model = torch.compile(model, mode='default')
 
 # helps estimate an arbitrarily accurate loss
 @torch.no_grad()
