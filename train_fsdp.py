@@ -159,7 +159,7 @@ data_dir = os.path.join('data', dataset.split(':')[-1].split('/')[-1]) if datase
 
 # --- HuggingFace streaming iterators with prefetch ---
 _HF_VAL_SKIP    = 5000  # skip first N docs for val (same split as prepare.py)
-_HF_PREFETCH_Q  = 4     # number of batches to prefetch ahead
+_HF_PREFETCH_Q  = 32    # number of batches to prefetch ahead (large buffer for fast GPUs)
 
 def _make_hf_iter(skip_docs=0):
     import tiktoken

@@ -10,7 +10,7 @@ import os as _os
 exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp10_gpt2large_gqa4_fineweb_stream'
-dataset        = 'hf:HuggingFaceFW/fineweb-edu'
+dataset        = 'fineweb_edu'  # local binary — run data/fineweb_edu/prepare.py first
 n_kv_head      = 4
 use_rope       = False
 wandb_run_name = 'exp10-gpt2small-gqa4-fineweb-stream'
