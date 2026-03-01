@@ -12,7 +12,7 @@ import os as _os
 exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp12_mha_fineweb_scratch'
-dataset        = 'fineweb_edu'
+dataset        = 'hf:HuggingFaceFW/fineweb-edu'
 init_from      = 'resume' if _os.path.exists('out_experiments/exp12_mha_fineweb_scratch/ckpt.pt') else 'scratch'
 n_kv_head      = 0              # MHA baseline — standard full attention
 use_rope       = True

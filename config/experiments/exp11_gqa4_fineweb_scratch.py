@@ -12,7 +12,7 @@ import os as _os
 exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp11_gqa4_fineweb_scratch'
-dataset        = 'fineweb_edu'
+dataset        = 'hf:HuggingFaceFW/fineweb-edu'
 init_from      = 'resume' if _os.path.exists('out_experiments/exp11_gqa4_fineweb_scratch/ckpt.pt') else 'scratch'
 n_kv_head      = 4              # GQA: 4 KV heads, 3 queries per KV head
 use_rope       = True           # RoPE — better for from-scratch training
