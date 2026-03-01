@@ -15,10 +15,10 @@ echo "Starting exp11: GQA n_kv_head=4 from scratch"
 echo "============================================"
 $PYTHON $TRAIN config/experiments/exp11_gqa4_fineweb_scratch.py
 
-echo "============================================"
-echo "Starting exp12: MHA baseline from scratch"
-echo "============================================"
-$PYTHON $TRAIN config/experiments/exp12_mha_fineweb_scratch.py
+# echo "============================================"
+# echo "Starting exp12: MHA baseline from scratch"
+#     echo "============================================"
+#     $PYTHON $TRAIN config/experiments/exp12_mha_fineweb_scratch.py
 
 echo "============================================"
 echo "Both experiments done. Compare results:"

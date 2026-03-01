@@ -23,8 +23,8 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 32
-gradient_accumulation_steps = 4   # effective batch = 128
+batch_size = 48
+gradient_accumulation_steps = 4   # effective batch = 192
 dropout    = 0.0
 compile    = True
 
