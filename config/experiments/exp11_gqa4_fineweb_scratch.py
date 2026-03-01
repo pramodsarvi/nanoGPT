@@ -29,12 +29,12 @@ dropout    = 0.0
 compile    = True
 
 # Single-cycle warmup + cosine decay
-max_iters      = 50000
+max_iters      = 20000
 eval_interval  = 500
 warmup_iters   = 500
 learning_rate  = 6e-4      # standard from-scratch LR for GPT-2 Small
 min_lr         = 6e-5      # 10x decay
 lr_scheduler   = 'cosine'
-lr_decay_iters = 50000
+lr_decay_iters = 20000
 weight_decay   = 1e-1
 grad_clip      = 1.0

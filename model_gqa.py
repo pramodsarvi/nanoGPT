@@ -206,22 +206,35 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-        if HAS_TRITON and getattr(config, 'use_triton', False):
-            self.gelu = TritonGELU()
+        self.use_swiglu = getattr(config, 'use_swiglu', False)
         self.use_triton = HAS_TRITON and getattr(config, 'use_triton', False)
 
+        if self.use_swiglu:
+            # SwiGLU: two up-projections, hidden dim scaled to 2/3 * 4 * n_embd
+            # to keep parameter count roughly equal to GELU MLP.
+            hidden = int(4 * config.n_embd * 2 / 3)
+            # round up to nearest multiple of 64 for efficiency
+            hidden = ((hidden + 63) // 64) * 64
+            self.gate_proj = nn.Linear(config.n_embd, hidden, bias=config.bias)
+            self.up_proj   = nn.Linear(config.n_embd, hidden, bias=config.bias)
+            self.c_proj    = nn.Linear(hidden, config.n_embd, bias=config.bias)
+        else:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.gelu    = nn.GELU()
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            if self.use_triton:
+                self.gelu = TritonGELU()
+
+        self.dropout = nn.Dropout(config.dropout)
+
     def forward(self, x):
-        if self.use_triton and x.is_cuda and self.c_fc.bias is not None:
+        if self.use_swiglu:
+            x = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        elif self.use_triton and x.is_cuda and self.c_fc.bias is not None:
             x = F.linear(x, self.c_fc.weight)
             x = triton_gelu_bias(x, self.c_fc.bias)
         else:
-            x = self.c_fc(x)
-            x = self.gelu(x)
+            x = self.gelu(self.c_fc(x))
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -267,6 +280,7 @@ class GPTConfigGQA:
     use_triton:  bool  = False
     rope_base:   int   = 10000   # RoPE frequency base (10000 = original, 500000 = LLaMA 3)
     use_rope:    bool  = True    # False = use learned absolute PE (compatible with GPT-2 pretrained weights)
+    use_swiglu:  bool  = False   # True = SwiGLU MLP (LLaMA-style); False = GELU (GPT-2 style)
 
 
 class GPTGQA(nn.Module):

@@ -62,7 +62,8 @@ n_embd = 768
 dropout = 0.0
 bias = False
 rope_base = 10000   # RoPE frequency base; 10000=original, 500000=LLaMA3 long-ctx
-use_rope  = True    # False = learned absolute PE (set False when loading GPT-2 pretrained weights)
+use_rope   = True    # False = learned absolute PE (set False when loading GPT-2 pretrained weights)
+use_swiglu = False   # True = SwiGLU MLP (LLaMA-style); False = GELU (GPT-2 style)
 # adamw optimizer
 learning_rate = 6e-4
 max_iters = 600000
@@ -257,9 +258,10 @@ _n_kv_head = n_kv_head if use_gqa else n_head  # resolved value
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout)
 if use_gqa:
-    model_args['n_kv_head'] = _n_kv_head
-    model_args['rope_base'] = rope_base
-    model_args['use_rope']  = use_rope
+    model_args['n_kv_head']  = _n_kv_head
+    model_args['rope_base']  = rope_base
+    model_args['use_rope']   = use_rope
+    model_args['use_swiglu'] = use_swiglu
 
 if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
@@ -276,7 +278,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     resume_keys = ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']
     if use_gqa:
-        resume_keys.extend(['n_kv_head', 'rope_base', 'use_rope'])
+        resume_keys.extend(['n_kv_head', 'rope_base', 'use_rope', 'use_swiglu'])
     for k in resume_keys:
         model_args[k] = checkpoint_model_args[k]
     if use_gqa:

@@ -29,12 +29,12 @@ dropout    = 0.0
 compile    = True
 
 # Identical schedule to exp11
-max_iters      = 50000
+max_iters      = 20000
 eval_interval  = 500
 warmup_iters   = 500
 learning_rate  = 6e-4
 min_lr         = 6e-5
 lr_scheduler   = 'cosine'
-lr_decay_iters = 50000
+lr_decay_iters = 20000
 weight_decay   = 1e-1
 grad_clip      = 1.0
