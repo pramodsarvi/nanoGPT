@@ -1,6 +1,6 @@
-# Experiment 10: Finetune pretrained GPT-2 Large, GQA with 4 KV heads, FineWeb-Edu streaming
-# GPT-2 Large: n_layer=36, n_head=16, n_embd=1280 (774M params)
-# n_kv_head=4: 4 groups of 4 query heads share one KV head
+# Experiment 10: Finetune pretrained GPT-2 Small, GQA with 4 KV heads, FineWeb-Edu streaming
+# GPT-2 Small: n_layer=12, n_head=12, n_embd=768 (117M params)
+# n_kv_head=4: 3 groups of 3 query heads share one KV head
 # No local train.bin needed — streams directly from HuggingFace.
 # Only val.bin required (~8MB): python3 data/fineweb_edu/prepare.py --val_only
 #
@@ -11,17 +11,17 @@ exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp10_gpt2large_gqa4_fineweb_stream'
 dataset        = 'hf:HuggingFaceFW/fineweb-edu'  # streams from HF, no local train.bin needed
-n_kv_head      = 4              # GQA: 4 KV heads shared across 16 query heads (4 queries per KV)
+n_kv_head      = 4              # GQA: 4 KV heads shared across 12 query heads (3 queries per KV)
 use_rope       = False          # use absolute PE to match GPT-2 pretrained weights
-wandb_run_name = 'exp10-gpt2large-gqa4-fineweb-stream'
+wandb_run_name = 'exp10-gpt2small-gqa4-fineweb-stream'
 
-# GPT-2 Large architecture
-n_layer    = 36
-n_head     = 16
-n_embd     = 1280
+# GPT-2 Small architecture
+n_layer    = 12
+n_head     = 12
+n_embd     = 768
 block_size = 1024
 batch_size = 32
-gradient_accumulation_steps = 2   # effective batch = 64
+gradient_accumulation_steps = 4   # effective batch = 128
 dropout    = 0.0  # no dropout when finetuning from pretrained
 compile    = True
 
@@ -39,7 +39,7 @@ if _os.path.exists(_ckpt):
     lr_decay_iters = 20000
 else:
     # Phase 1: GQA recovery with aggressive LR and cosine restarts
-    init_from         = 'gpt2-large_to_gqa'
+    init_from         = 'gpt2_to_gqa'
     max_iters         = 20000
     eval_interval     = 500
     warmup_iters      = 100
