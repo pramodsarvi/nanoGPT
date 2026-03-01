@@ -133,6 +133,14 @@ if master_process:
         csv_writer.writerow(['iter', 'train_loss', 'val_loss', 'lr', 'tokens_seen', 'run_name'])
         csv_file.flush()
 
+    # Per-step CSV log — train loss + LR every log_interval steps for visualisation
+    steps_csv_path = os.path.join(out_dir, 'log_steps.csv')
+    steps_csv_file = open(steps_csv_path, 'a', newline='')
+    steps_csv_writer = csv.writer(steps_csv_file)
+    if os.path.getsize(steps_csv_path) == 0:
+        steps_csv_writer.writerow(['iter', 'train_loss', 'lr', 'tokens_seen'])
+        steps_csv_file.flush()
+
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -535,6 +543,8 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+        steps_csv_writer.writerow([iter_num, f"{lossf:.4f}", f"{lr:.6f}", iter_num * tokens_per_iter])
+        steps_csv_file.flush()
     
     iter_num += 1
     local_iter_num += 1
@@ -547,3 +557,4 @@ if fsdp:
 
 if master_process:
     csv_file.close()
+    steps_csv_file.close()
