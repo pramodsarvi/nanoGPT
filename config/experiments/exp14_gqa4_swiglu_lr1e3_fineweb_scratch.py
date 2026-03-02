@@ -25,6 +25,7 @@ block_size = 1024
 batch_size = 96                   # logits (B, T, vocab) = 9.2GB; use PYTORCH_ALLOC_CONF=expandable_segments:True
 gradient_accumulation_steps = 6   # effective batch = 96×1024×6 = 589,824 tokens/step
 hf_prefetch_batches = 128         # large prefetch buffer to keep H100 fed
+hf_tokenizer_threads = 8          # parallel tokenizer threads — H100 needs more CPU throughput
 dropout    = 0.0
 compile    = True
 

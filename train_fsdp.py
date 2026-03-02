@@ -52,6 +52,7 @@ wandb_run_name = ''   # auto-generated from config if empty: e.g. gqa4-rope-L6H6
 # data
 dataset = 'openwebtext'
 hf_prefetch_batches = 32    # batches to prefetch in background thread (increase for fast GPUs)
+hf_tokenizer_threads = 2   # parallel tokenizer threads (increase for fast GPUs, e.g. 4-8 on H100)
 gradient_accumulation_steps = 5 * 8
 batch_size = 12
 block_size = 1024
@@ -183,32 +184,36 @@ def _make_hf_iter(skip_docs=0):
     return _token_gen()
 
 class _HFPrefetcher:
-    """Fills a queue with pre-tokenized CPU tensors in a background thread."""
+    """Fills a queue with pre-tokenized CPU tensors using multiple background threads."""
     def __init__(self, split):
         self.split = split
         self.q = queue.Queue(maxsize=hf_prefetch_batches)
         self._stop = threading.Event()
-        self._buf = []
-        self._it = _make_hf_iter(skip_docs=0 if split == 'val' else _HF_VAL_SKIP)
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        skip = 0 if split == 'val' else _HF_VAL_SKIP
+        self._threads = [
+            threading.Thread(target=self._worker, args=(skip,), daemon=True)
+            for _ in range(hf_tokenizer_threads)
+        ]
+        for t in self._threads:
+            t.start()
 
-    def _fill(self, needed):
-        while len(self._buf) < needed:
-            try:
-                self._buf.append(next(self._it))
-            except StopIteration:
-                # restart iterator on exhaustion
-                self._it = _make_hf_iter(skip_docs=0 if self.split == 'val' else _HF_VAL_SKIP)
-
-    def _worker(self):
+    def _worker(self, skip_docs):
+        import tiktoken
+        enc = tiktoken.get_encoding('gpt2')
+        eot = enc.eot_token
+        buf = []
         needed = batch_size * (block_size + 1)
+        it = _make_hf_iter(skip_docs=skip_docs)
         while not self._stop.is_set():
-            self._fill(needed)
-            tokens = torch.tensor(self._buf[:needed], dtype=torch.long)
-            del self._buf[:batch_size * block_size]
+            while len(buf) < needed:
+                try:
+                    buf.append(next(it))
+                except StopIteration:
+                    it = _make_hf_iter(skip_docs=skip_docs)
+            tokens = torch.tensor(buf[:needed], dtype=torch.long)
+            del buf[:needed]
             tokens = tokens.view(batch_size, block_size + 1)
-            x = tokens[:, :-1]  # CPU tensor — .to(device) done in main thread
+            x = tokens[:, :-1]
             y = tokens[:, 1:]
             self.q.put((x, y))  # blocks if queue is full (natural backpressure)
 
