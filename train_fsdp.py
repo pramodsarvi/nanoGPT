@@ -51,6 +51,7 @@ wandb_project = 'nanogpt'
 wandb_run_name = ''   # auto-generated from config if empty: e.g. gqa4-rope-L6H6E384
 # data
 dataset = 'openwebtext'
+hf_prefetch_batches = 32    # batches to prefetch in background thread (increase for fast GPUs)
 gradient_accumulation_steps = 5 * 8
 batch_size = 12
 block_size = 1024
@@ -160,7 +161,6 @@ data_dir = os.path.join('data', dataset.split(':')[-1].split('/')[-1]) if datase
 
 # --- HuggingFace streaming iterators with prefetch ---
 _HF_VAL_SKIP    = 5000  # skip first N docs for val (same split as prepare.py)
-_HF_PREFETCH_Q  = 32    # number of batches to prefetch ahead (large buffer for fast GPUs)
 
 def _make_hf_iter(skip_docs=0):
     import tiktoken
@@ -186,7 +186,7 @@ class _HFPrefetcher:
     """Fills a queue with pre-tokenized CPU tensors in a background thread."""
     def __init__(self, split):
         self.split = split
-        self.q = queue.Queue(maxsize=_HF_PREFETCH_Q)
+        self.q = queue.Queue(maxsize=hf_prefetch_batches)
         self._stop = threading.Event()
         self._buf = []
         self._it = _make_hf_iter(skip_docs=0 if split == 'val' else _HF_VAL_SKIP)

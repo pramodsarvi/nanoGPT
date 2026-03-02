@@ -24,6 +24,7 @@ n_embd     = 768
 block_size = 1024
 batch_size = 128                  # H100 has 80GB — push batch size up from 48
 gradient_accumulation_steps = 4   # effective batch = 524,288 tokens/step
+hf_prefetch_batches = 128         # large prefetch buffer to keep H100 fed
 dropout    = 0.0
 compile    = True
 
