@@ -22,8 +22,8 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 128                  # H100 has 80GB — push batch size up from 48
-gradient_accumulation_steps = 4   # effective batch = 524,288 tokens/step
+batch_size = 64                   # logits (B, T, vocab) are the bottleneck: 64×1024×50304×2B = 6.1GB
+gradient_accumulation_steps = 8   # effective batch = 524,288 tokens/step (same as before)
 hf_prefetch_batches = 128         # large prefetch buffer to keep H100 fed
 dropout    = 0.0
 compile    = True
