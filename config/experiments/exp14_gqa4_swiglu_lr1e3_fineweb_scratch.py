@@ -6,12 +6,11 @@
 # Run:
 #   python train_fsdp.py config/experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch.py
 
-import os as _os
 exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch'
 dataset        = 'hf:HuggingFaceFW/fineweb-edu'
-init_from      = 'resume' if _os.path.exists('out_experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch/ckpt.pt') else 'scratch'
+init_from      = 'weights_only'
 n_kv_head      = 4
 use_rope       = True
 use_swiglu     = True

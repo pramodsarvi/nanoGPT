@@ -184,23 +184,16 @@ def _make_hf_iter(skip_docs=0):
     return _token_gen()
 
 class _HFPrefetcher:
-    """Fills a queue with pre-tokenized CPU tensors using multiple background threads."""
+    """Fills a queue with pre-tokenized CPU tensors in a single background thread."""
     def __init__(self, split):
         self.split = split
         self.q = queue.Queue(maxsize=hf_prefetch_batches)
         self._stop = threading.Event()
         skip = 0 if split == 'val' else _HF_VAL_SKIP
-        self._threads = [
-            threading.Thread(target=self._worker, args=(skip,), daemon=True)
-            for _ in range(hf_tokenizer_threads)
-        ]
-        for t in self._threads:
-            t.start()
+        self._thread = threading.Thread(target=self._worker, args=(skip,), daemon=True)
+        self._thread.start()
 
     def _worker(self, skip_docs):
-        import tiktoken
-        enc = tiktoken.get_encoding('gpt2')
-        eot = enc.eot_token
         buf = []
         needed = batch_size * (block_size + 1)
         it = _make_hf_iter(skip_docs=skip_docs)
@@ -277,7 +270,7 @@ if init_from == 'scratch':
         gptconf = GPTConfig(**model_args)
         model = GPT(gptconf)
 
-elif init_from == 'resume':
+elif init_from in ('resume', 'weights_only'):
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location='cpu')
     checkpoint_model_args = checkpoint['model_args']
@@ -298,8 +291,13 @@ elif init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    if init_from == 'weights_only':
+        iter_num = 0
+        best_val_loss = 1e9
+        print("weights_only: loaded model weights, reset iter_num and optimizer state")
+    else:
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
 
 elif init_from == 'mha_to_gqa':
     # Load a standard MHA checkpoint and convert to GQA by dropping KV heads
