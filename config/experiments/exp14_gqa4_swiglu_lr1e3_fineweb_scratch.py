@@ -22,8 +22,8 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 64                   # logits (B, T, vocab) are the bottleneck: 64×1024×50304×2B = 6.1GB
-gradient_accumulation_steps = 8   # effective batch = 524,288 tokens/step (same as before)
+batch_size = 96                   # logits (B, T, vocab) = 9.2GB; use PYTORCH_ALLOC_CONF=expandable_segments:True
+gradient_accumulation_steps = 6   # effective batch = 96×1024×6 = 589,824 tokens/step
 hf_prefetch_batches = 128         # large prefetch buffer to keep H100 fed
 dropout    = 0.0
 compile    = True
