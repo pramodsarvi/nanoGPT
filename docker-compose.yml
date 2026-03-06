@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────
+# docker-compose for nanoGPT FSDP training
+# ─────────────────────────────────────────────────────────────
+# Usage:
+#   docker compose run train           # run default experiment (exp15, 2× GPU)
+#   docker compose run sample          # sample from trained model
+#   docker compose run --rm train \    # custom experiment
+#     torchrun --standalone --nproc_per_node=4 train_fsdp.py config/experiments/exp16_gqa4_swiglu_fast_4gpu.py
+# ─────────────────────────────────────────────────────────────
+
+services:
+  train:
+    build: .
+    image: nanogpt
+    ipc: host
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    volumes:
+      - ./data:/workspace/data
+      - ./out_experiments:/workspace/out_experiments
+    environment:
+      - NCCL_DEBUG=INFO
+      - TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+    command: >
+      torchrun --standalone --nproc_per_node=2 train_fsdp.py config/experiments/exp15_gqa4_swiglu_lr1e3_fineweb_4gpu.py
+
+  sample:
+    build: .
+    image: nanogpt
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    volumes:
+      - ./data:/workspace/data
+      - ./out_experiments:/workspace/out_experiments
+    command: >
+      python sample.py --out_dir=out_experiments/exp15_gqa4_swiglu_lr1e3_fineweb_4gpu --num_samples=5

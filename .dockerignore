@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+
+# Data (mounted as volume, not baked into image)
+data/
+out/
+out_fsdp/
+out_experiments/
+
+# Notebooks & docs
+*.ipynb
+*.md
+assets/
+scaling_laws.ipynb
+transformer_sizing.ipynb
+
+# IDE
+.vscode
+.idea
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
