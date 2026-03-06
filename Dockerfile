@@ -3,7 +3,9 @@ FROM nvcr.io/nvidia/pytorch:24.12-py3
 WORKDIR /workspace
 
 # Clone the repo
-RUN git clone --branch gqa-implementation https://github.com/pramodsarvi/nanoGPT.git 
+RUN git clone --branch gqa-implementation https://github.com/pramodsarvi/nanoGPT.git
+
+WORKDIR /workspace/nanoGPT
 
 # Install Python dependencies not included in NGC image
 RUN pip3 install -r requirements.txt
