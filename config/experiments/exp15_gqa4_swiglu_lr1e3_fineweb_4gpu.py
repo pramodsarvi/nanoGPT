@@ -21,11 +21,11 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 96                   # per-GPU micro-batch; fits on H100 80GB with FSDP FULL_SHARD
-gradient_accumulation_steps = 8   # divisible by 2 GPUs → 4 accum steps per GPU
-                                  # effective batch = 96 × 1024 × 8 = 786,432 tokens/iter
-hf_prefetch_batches  = 256        # large prefetch buffer to keep H100s fed
-hf_tokenizer_threads = 8          # single thread — multiple threads cause data duplication
+batch_size = 64                   # Lowered from 96 to fix OOM
+gradient_accumulation_steps = 12  # 12 * 64 * 1024 = 786,432 (Same effective batch as 96 * 8)
+                                  # divisible by 2 GPUs → 6 accum steps per GPU
+hf_prefetch_batches  = 64         # Lowered from 256 to reduce CPU/pinned RAM usage
+hf_tokenizer_threads = 1          # Keep at 1 to avoid redundant dataloader RAM usage
 dropout    = 0.0
 compile    = True
 
