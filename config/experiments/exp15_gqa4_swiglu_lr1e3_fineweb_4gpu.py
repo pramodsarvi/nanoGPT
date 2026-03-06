@@ -24,8 +24,8 @@ block_size = 1024
 batch_size = 64                   # Lowered from 96 to fix OOM
 gradient_accumulation_steps = 12  # 12 * 64 * 1024 = 786,432 (Same effective batch as 96 * 8)
                                   # divisible by 2 GPUs → 6 accum steps per GPU
-hf_prefetch_batches  = 64         # Lowered from 256 to reduce CPU/pinned RAM usage
-hf_tokenizer_threads = 1          # Keep at 1 to avoid redundant dataloader RAM usage
+hf_prefetch_batches  = 128         # Lowered from 256 to reduce CPU/pinned RAM usage
+hf_tokenizer_threads = 8          # Keep at 1 to avoid redundant dataloader RAM usage
 dropout    = 0.0
 compile    = True
 
