@@ -21,7 +21,7 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 80                   # Increased to 80 for better 80GB memory utilization
+batch_size = 72                   # Increased to 80 for better 80GB memory utilization
 gradient_accumulation_steps = 10  # 10 * 80 * 1024 = 819,200 (Roughly same effective batch)
                                   # divisible by 2 GPUs → 5 accum steps per GPU
 hf_prefetch_batches  = 128         # Lowered from 256 to reduce CPU/pinned RAM usage
