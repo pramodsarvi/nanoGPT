@@ -21,11 +21,11 @@ n_head     = 12
 n_embd     = 768
 block_size = 1024
 batch_size = 96                   # logits (B, T, vocab) = 9.2GB per GPU
-gradient_accumulation_steps = 6   # divided by 2 GPUs = 3 per GPU; effective batch = 96×1024×6×2 = 1,179,648 tokens/step
+gradient_accumulation_steps = 8   # divided by 4 GPUs = 2 per GPU; effective batch = 96×1024×8×4 = 3,145,728 tokens/step
 hf_prefetch_batches  = 128        # large prefetch buffer to keep H100s fed
 hf_tokenizer_threads = 1          # single thread — multiple threads cause data duplication
 dropout    = 0.0
-compile    = True
+compile    = False
 
 # Higher LR with proportionally higher min_lr (keep 10x ratio)
 max_iters      = 15000

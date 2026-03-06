@@ -4,4 +4,4 @@ tiktoken
 datasets
 wandb
 transformers
-triton
+triton=2.4.0
