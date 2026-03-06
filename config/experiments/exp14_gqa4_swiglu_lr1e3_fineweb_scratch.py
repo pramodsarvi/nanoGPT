@@ -1,16 +1,15 @@
 # Experiment 14: GPT-2 Small from scratch, GQA (n_kv_head=4) + SwiGLU + lr=1e-3
 # vs exp11: higher LR (1e-3 vs 6e-4) + SwiGLU activation
 # vs exp13: same SwiGLU but higher LR
-# Run on H100 — increase batch size to take advantage of extra VRAM.
-#
-# Run:
-#   python train_fsdp.py config/experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch.py
+# Run on 2× H100 with FSDP:
+#   torchrun --standalone --nproc_per_node=2 train_fsdp.py config/experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch.py
 
+import os as _os
 exec(open('config/experiments/base.py').read())
 
 out_dir        = 'out_experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch'
 dataset        = 'hf:HuggingFaceFW/fineweb-edu'
-init_from      = 'weights_only'
+init_from      = 'resume' if _os.path.exists('out_experiments/exp14_gqa4_swiglu_lr1e3_fineweb_scratch/ckpt.pt') else 'scratch'
 n_kv_head      = 4
 use_rope       = True
 use_swiglu     = True
@@ -21,10 +20,10 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 96                   # logits (B, T, vocab) = 9.2GB; use PYTORCH_ALLOC_CONF=expandable_segments:True
-gradient_accumulation_steps = 6   # effective batch = 96×1024×6 = 589,824 tokens/step
-hf_prefetch_batches = 128         # large prefetch buffer to keep H100 fed
-hf_tokenizer_threads = 8          # parallel tokenizer threads — H100 needs more CPU throughput
+batch_size = 96                   # logits (B, T, vocab) = 9.2GB per GPU
+gradient_accumulation_steps = 6   # divided by 2 GPUs = 3 per GPU; effective batch = 96×1024×6×2 = 1,179,648 tokens/step
+hf_prefetch_batches  = 128        # large prefetch buffer to keep H100s fed
+hf_tokenizer_threads = 1          # single thread — multiple threads cause data duplication
 dropout    = 0.0
 compile    = True
 

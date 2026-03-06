@@ -27,6 +27,7 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     CPUOffload,
     StateDictType,
+    FullStateDictConfig,
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
@@ -184,12 +185,18 @@ def _make_hf_iter(skip_docs=0):
     return _token_gen()
 
 class _HFPrefetcher:
-    """Fills a queue with pre-tokenized CPU tensors in a single background thread."""
+    """Fills a queue with pre-tokenized CPU tensors in a single background thread.
+    Each rank skips an additional rank*skip_stride docs so ranks see different data.
+    """
     def __init__(self, split):
         self.split = split
         self.q = queue.Queue(maxsize=hf_prefetch_batches)
         self._stop = threading.Event()
-        skip = 0 if split == 'val' else _HF_VAL_SKIP
+        # rank 0: starts at _HF_VAL_SKIP, rank 1: starts at _HF_VAL_SKIP + stride, etc.
+        # stride = large prime number of docs to ensure non-overlapping windows
+        _rank = int(os.environ.get('RANK', 0))
+        _stride = 100003  # ~100K docs between ranks — effectively non-overlapping
+        skip = 0 if split == 'val' else (_HF_VAL_SKIP + _rank * _stride)
         self._thread = threading.Thread(target=self._worker, args=(skip,), daemon=True)
         self._thread.start()
 
@@ -362,13 +369,35 @@ if fsdp:
         device_id=torch.cuda.current_device(),
         sharding_strategy=ShardingStrategy.FULL_SHARD, # or SHARD_GRAD_OP for Zero-2
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        use_orig_params=True,   # preserve original param shapes so configure_optimizers works
         limit_all_gathers=True,
     )
+
+# Keep a reference to the FSDP-wrapped model for FSDP-specific operations
+# (no_sync, clip_grad_norm_, state_dict_type) since torch.compile() wraps it
+fsdp_model = model if fsdp else None
 
 # optimizer
 # Note: configure_optimizers should be called on the FSDP model
 # so it picks up the sharded (flattened) parameters correctly.
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+# Load optimizer state if resuming from checkpoint
+if init_from == 'resume':
+    if fsdp and 'optimizer' in checkpoint:
+        # Scatter the full optimizer state dict across FSDP ranks
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, save_policy):
+            optim_state = FSDP.optim_state_dict_to_load(
+                fsdp_model, optimizer, checkpoint['optimizer']
+            )
+        optimizer.load_state_dict(optim_state)
+        print("loaded FSDP optimizer state from checkpoint")
+    elif not fsdp and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print("loaded optimizer state from checkpoint")
+if init_from in ('resume', 'weights_only'):
+    checkpoint = None  # free memory
 
 # GradScaler - use ShardedGradScaler if using FSDP with float16
 if dtype == 'float16':
@@ -376,7 +405,7 @@ if dtype == 'float16':
     scaler = ShardedGradScaler(enabled=True)
 else:
     # for bfloat16 or float32, we don't need scaling
-    scaler = torch.cuda.amp.GradScaler(enabled=False)
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
 
 # compile the model AFTER FSDP wrapping
 if compile:
@@ -454,7 +483,7 @@ t0 = time.time()
 local_iter_num = 0
 # For FSDP, raw_model is the underlying model before wrapping if we want it, 
 # but for estimate_mfu we need the config etc.
-# FSDP model has access to original module if needed via ._orig_mod if compiled
+# For FSDP-specific ops, use fsdp_model (pre-compile reference)
 raw_model = model._orig_mod if compile else model
 
 while True:
@@ -462,55 +491,57 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
+        # All ranks must participate in estimate_loss() — it contains dist.all_reduce
         losses = estimate_loss()
-        tokens_seen = iter_num * tokens_per_iter
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        # CSV log — always written
-        csv_writer.writerow([
-            iter_num,
-            f"{losses['train']:.4f}",
-            f"{losses['val']:.4f}",
-            f"{lr:.6f}",
-            tokens_seen,
-            wandb_run_name,
-        ])
-        csv_file.flush()
-
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "tokens_seen": tokens_seen,
-            })
-        
-        # Checkpointing — FSDP needs special state_dict handling; plain model does not
+        # All ranks must participate in FSDP state_dict collection (collective op)
         if fsdp:
-            from torch.distributed.fsdp import FullStateDictConfig
             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                cpu_state = model.state_dict()
+            with FSDP.state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, save_policy):
+                cpu_state = fsdp_model.state_dict()
+                # Gather full optimizer state (all ranks must call; only rank 0 gets data)
+                cpu_optim_state = FSDP.optim_state_dict(fsdp_model, optimizer)
         else:
             cpu_state = model.state_dict()
+            cpu_optim_state = optimizer.state_dict()
 
         if master_process:
-            checkpoint = {
-                'model': cpu_state,
-                # optimizer state also needs sharding/unsharding for full recovery
-                # but for simplicity we just save the rank 0 state if possible, 
-                # though FSDP optimizer state is sharded. 
-                # Full recovery requires FSDP.full_optim_state_dict(model, optimizer)
-                'optimizer': optimizer.state_dict(), 
-                'model_args': model_args,
-                'iter_num': iter_num,
-                'best_val_loss': best_val_loss,
-                'config': config,
-            }
-            print(f"saving checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            tokens_seen = iter_num * tokens_per_iter
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+            # CSV log — always written
+            csv_writer.writerow([
+                iter_num,
+                f"{losses['train']:.4f}",
+                f"{losses['val']:.4f}",
+                f"{lr:.6f}",
+                tokens_seen,
+                wandb_run_name,
+            ])
+            csv_file.flush()
+
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "tokens_seen": tokens_seen,
+                })
+
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = min(best_val_loss, losses['val'])
+                checkpoint = {
+                    'model': cpu_state,
+                    'optimizer': cpu_optim_state,
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                print(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
     if iter_num == 0 and eval_only:
         break
@@ -522,7 +553,7 @@ while True:
         is_last_micro_step = (micro_step == gradient_accumulation_steps - 1)
         
         # We only sync on the last micro step
-        context = nullcontext() if is_last_micro_step or not fsdp else model.no_sync()
+        context = nullcontext() if is_last_micro_step or not fsdp else fsdp_model.no_sync()
         
         with context:
             with ctx:
@@ -535,7 +566,7 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         if fsdp:
-            model.clip_grad_norm_(grad_clip)
+            fsdp_model.clip_grad_norm_(grad_clip)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     
