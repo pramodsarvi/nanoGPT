@@ -67,6 +67,7 @@ bias = False
 rope_base = 10000   # RoPE frequency base; 10000=original, 500000=LLaMA3 long-ctx
 use_rope   = True    # False = learned absolute PE (set False when loading GPT-2 pretrained weights)
 use_swiglu = False   # True = SwiGLU MLP (LLaMA-style); False = GELU (GPT-2 style)
+gradient_checkpointing = False  # recompute block activations on backward; saves ~30-40% memory, ~20% slower
 # adamw optimizer
 learning_rate = 6e-4
 max_iters = 600000
@@ -187,16 +188,20 @@ def _make_hf_iter(skip_docs=0):
 class _HFPrefetcher:
     """Fills a queue with pre-tokenized CPU tensors in a single background thread.
     Each rank skips an additional rank*skip_stride docs so ranks see different data.
+    docs_consumed is incremented as docs are processed and can be saved/restored via checkpoint.
     """
-    def __init__(self, split):
+    def __init__(self, split, resume_docs=0):
         self.split = split
         self.q = queue.Queue(maxsize=hf_prefetch_batches)
         self._stop = threading.Event()
+        self.docs_consumed = resume_docs  # tracks total docs processed (saved in checkpoint)
+        self._lock = threading.Lock()
         # rank 0: starts at _HF_VAL_SKIP, rank 1: starts at _HF_VAL_SKIP + stride, etc.
         # stride = large prime number of docs to ensure non-overlapping windows
         _rank = int(os.environ.get('RANK', 0))
         _stride = 100003  # ~100K docs between ranks — effectively non-overlapping
-        skip = 0 if split == 'val' else (_HF_VAL_SKIP + _rank * _stride)
+        base_skip = 0 if split == 'val' else (_HF_VAL_SKIP + _rank * _stride)
+        skip = base_skip + resume_docs  # fast-forward past already-seen docs on resume
         self._thread = threading.Thread(target=self._worker, args=(skip,), daemon=True)
         self._thread.start()
 
@@ -204,12 +209,19 @@ class _HFPrefetcher:
         buf = []
         needed = batch_size * (block_size + 1)
         it = _make_hf_iter(skip_docs=skip_docs)
+        docs_this_epoch = 0
         while not self._stop.is_set():
             while len(buf) < needed:
                 try:
-                    buf.append(next(it))
+                    token = next(it)
+                    buf.append(token)
+                    # count a doc each time we see the EOT token
+                    if token == 50256:  # GPT-2 EOT token
+                        docs_this_epoch += 1
+                        with self._lock:
+                            self.docs_consumed += 1
                 except StopIteration:
-                    it = _make_hf_iter(skip_docs=skip_docs)
+                    it = _make_hf_iter(skip_docs=0)  # wrap around from start
             tokens = torch.tensor(buf[:needed], dtype=torch.long)
             del buf[:needed]
             tokens = tokens.view(batch_size, block_size + 1)
@@ -221,15 +233,21 @@ class _HFPrefetcher:
         x, y = self.q.get()
         return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
+    def get_docs_consumed(self):
+        with self._lock:
+            return self.docs_consumed
+
     def stop(self):
         self._stop.set()
 
 _hf_prefetchers = {}  # keyed by split, initialized lazily
+_hf_resume_docs = 0  # docs to skip on first init of train prefetcher (set from checkpoint)
 
 def _hf_get_batch(split):
     global _hf_prefetchers
     if split not in _hf_prefetchers:
-        _hf_prefetchers[split] = _HFPrefetcher(split)
+        resume = _hf_resume_docs if split == 'train' else 0
+        _hf_prefetchers[split] = _HFPrefetcher(split, resume_docs=resume)
     return _hf_prefetchers[split].next_batch()
 
 def get_batch(split):
@@ -263,10 +281,11 @@ _n_kv_head = n_kv_head if use_gqa else n_head  # resolved value
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout)
 if use_gqa:
-    model_args['n_kv_head']  = _n_kv_head
-    model_args['rope_base']  = rope_base
-    model_args['use_rope']   = use_rope
-    model_args['use_swiglu'] = use_swiglu
+    model_args['n_kv_head']               = _n_kv_head
+    model_args['rope_base']               = rope_base
+    model_args['use_rope']                = use_rope
+    model_args['use_swiglu']              = use_swiglu
+    model_args['gradient_checkpointing']  = gradient_checkpointing
 
 if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
@@ -284,6 +303,7 @@ elif init_from in ('resume', 'weights_only'):
     resume_keys = ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']
     if use_gqa:
         resume_keys.extend(['n_kv_head', 'rope_base', 'use_rope', 'use_swiglu'])
+        # gradient_checkpointing is a runtime flag, not saved in checkpoint; apply after load
     for k in resume_keys:
         model_args[k] = checkpoint_model_args[k]
     if use_gqa:
@@ -305,6 +325,9 @@ elif init_from in ('resume', 'weights_only'):
     else:
         iter_num = checkpoint['iter_num']
         best_val_loss = checkpoint['best_val_loss']
+        _hf_resume_docs = checkpoint.get('hf_docs_consumed', 0)
+        if _hf_resume_docs:
+            print(f"resuming HF data stream at doc offset {_hf_resume_docs:,}")
 
 elif init_from == 'mha_to_gqa':
     # Load a standard MHA checkpoint and convert to GQA by dropping KV heads
@@ -341,6 +364,12 @@ elif init_from.startswith('gpt2'):
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size
+
+# apply gradient checkpointing (GQA only; MHA model.py does not support it yet)
+if gradient_checkpointing and use_gqa:
+    model.config.gradient_checkpointing = True
+    if master_process:
+        print("gradient checkpointing enabled")
 
 model.to(device)
 
@@ -532,6 +561,9 @@ while True:
 
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = min(best_val_loss, losses['val'])
+                # snapshot HF doc offset so we can resume the data stream exactly
+                _train_prefetcher = _hf_prefetchers.get('train') if dataset.startswith('hf:') else None
+                hf_docs_consumed = _train_prefetcher.get_docs_consumed() if _train_prefetcher else 0
                 checkpoint = {
                     'model': cpu_state,
                     'optimizer': cpu_optim_state,
@@ -539,6 +571,7 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'hf_docs_consumed': hf_docs_consumed,
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))

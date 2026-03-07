@@ -1,255 +1,227 @@
-
-# nanoGPT — Extended
+# nanoGPT — GQA + RoPE + SwiGLU
 
 ![nanoGPT](assets/nanogpt.jpg)
 
-This is an extended fork of [Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) adding:
+A fork of [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT) extended with:
 
-- **Grouped Query Attention (GQA)** with configurable KV heads
-- **Rotary Position Embeddings (RoPE)** replacing learned absolute positional embeddings
-- **FSDP training** (Fully Sharded Data Parallel) for multi-GPU runs
-- **FineWeb-Edu streaming data prep** — no full dataset download required
-- **Experiment infrastructure** — named configs, CSV logging, comparison script
+- **Grouped Query Attention (GQA)** — multiple query heads share a single KV head, shrinking the KV cache
+- **Rotary Position Embeddings (RoPE)** — replaces learned absolute position embeddings
+- **SwiGLU MLP** — LLaMA-style gated activation replacing GELU
+- **FSDP training** — multi-GPU training with PyTorch Fully Sharded Data Parallel
+- **HuggingFace streaming** — train on FineWeb-Edu without downloading the full dataset
+- **Triton GQA kernels** — native prefill/decode kernels without `repeat_interleave` expansion
 
 ---
 
-## Environment
+## Repository Layout
 
-```bash
-# Python 3.12, venv at ~/venv
-~/venv/bin/pip install torch numpy transformers datasets tiktoken wandb tqdm
+```
+nanoGPT/
+├── model.py                    # Original nanoGPT MHA model
+├── model_gqa.py                # GQA + RoPE + SwiGLU model
+├── train.py                    # Original single-GPU training script
+├── train_fsdp.py               # FSDP multi-GPU training (supports GQA)
+├── configurator.py             # Config file loader
+├── triton_kernels.py           # Triton kernels for original model
+├── triton_kernels_gqa.py       # Native Triton GQA prefill + decode kernels
+├── eval/
+│   ├── bench_inference.py      # GQA vs MHA KV cache benchmark
+│   ├── bench.py                # Original throughput benchmark
+│   ├── bench_gqa.py            # GQA throughput benchmark
+│   ├── bench_triton_vs_hf.py   # Triton vs HuggingFace attention comparison
+│   ├── compare_accuracy.py     # Perplexity vs HuggingFace GPT-2
+│   ├── plot_loss.py            # Training curve plots
+│   ├── sample.py               # Text generation (original model)
+│   └── sample_gqa.py           # Text generation (GQA model)
+├── config/
+│   └── experiments/            # Per-experiment config files
+└── data/
+    ├── shakespeare_char/       # Character-level Shakespeare (quick tests)
+    └── fineweb_edu/            # Streaming dataset prep for FineWeb-Edu
 ```
 
 ---
 
-## File Overview
+## Architecture Changes from nanoGPT
 
-| File | Description |
-|---|---|
-| `model.py` | Original GPT: MHA + learned absolute position embeddings + KV cache + Triton kernels |
-| `model_gqa.py` | **New**: GPT with GQA + RoPE (see details below) |
-| `train.py` | Original single/multi-GPU training script (DDP) |
-| `train_fsdp.py` | **New/Modified**: FSDP training script; supports both MHA and GQA models |
-| `sample.py` | Sampling / inference script |
-| `bench.py` | Quick benchmark of the training loop |
-| `configurator.py` | Config override mechanism used by all train scripts |
-| `triton_kernels.py` | Optional Triton kernels for LayerNorm, GELU, attention |
+### Grouped Query Attention
 
-**Data:**
+Standard MHA gives every query head its own Key and Value head. GQA groups queries so they share KV heads:
 
-| Path | Description |
-|---|---|
-| `data/shakespeare_char/` | Character-level Shakespeare — tiny, for quick tests |
-| `data/shakespeare/` | BPE-tokenized Shakespeare — for finetuning from GPT-2 |
-| `data/openwebtext/` | OpenWebText — classic nanoGPT benchmark (~9B tokens, ~70GB) |
-| `data/fineweb_edu/` | **New**: FineWeb-Edu 10BT — higher quality, streamed from HuggingFace |
+```
+MHA: n_head=12  →  12 Q heads, 12 K heads, 12 V heads
+GQA: n_head=12, n_kv_head=4  →  12 Q heads, 4 K heads, 4 V heads  (3× smaller KV cache)
+MQA: n_head=12, n_kv_head=1  →  12 Q heads, 1 K head,  1 V head   (12× smaller KV cache)
+```
 
-**Configs:**
-
-| Path | Description |
-|---|---|
-| `config/train_shakespeare_char.py` | Original Shakespeare char config (MHA) |
-| `config/train_shakespeare_gqa.py` | Shakespeare char with GQA + RoPE |
-| `config/train_gpt2.py` | GPT-2 124M reproduction config |
-| `config/experiments/` | **New**: Named experiment configs for architecture comparison |
-
----
-
-## What's New
-
-### 1. Grouped Query Attention (`model_gqa.py`)
-
-GQA reduces the number of Key/Value heads while keeping full Query heads. Multiple query heads share a single KV head, reducing KV cache memory at inference time.
-
-**Key config param:** `n_kv_head`
-
-| `n_kv_head` | Mode | Description |
-|---|---|---|
-| `n_head` | MHA | Standard multi-head attention (no sharing) |
-| `1` | MQA | All query heads share one KV head — maximum compression |
-| `2–n_head-1` | GQA | Intermediate — e.g. `n_kv_head=4` with `n_head=12` → 3 queries per KV head |
-
-**Projection sizes:**
-- `q_proj`: `n_embd → n_embd` (all query heads)
-- `kv_proj`: `n_embd → 2 × n_kv_head × head_dim` (K + V, reduced)
-- `c_proj`: `n_embd → n_embd` (output, unchanged)
-
-KV heads are expanded to match query heads via `repeat_interleave` before attention — no extra parameters, just a view.
-
-**KV cache** shape is `(B, n_kv_head, T, head_dim)` — smaller than standard MHA.
-
-### 2. Rotary Position Embeddings (RoPE)
-
-RoPE replaces the learned `wpe` embedding table. Position information is encoded directly into Q and K via rotation, not added to token embeddings.
-
-**Benefits over absolute PE:**
-- No learned parameters for position (saves `block_size × n_embd` params)
-- Better length generalisation
-- Position offset-aware during KV cache decoding — each new token gets the correct absolute position automatically
-
-**Key config param:** `rope_base` (default `10000`, set `500000` for LLaMA 3-style long context)
-
-RoPE is applied **only to Q and K**, never to V — matching the original paper and all modern implementations.
-
-### 3. Loading MHA → GQA (`from_mha_checkpoint`)
+The fused `c_attn` projection is split into separate `q_proj` and `kv_proj`:
 
 ```python
-model, iter_num, best_val_loss = GPTGQA.from_mha_checkpoint(
-    ckpt_path='out/ckpt.pt',
-    n_kv_head=4,
-)
+# Original nanoGPT
+self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+
+# GQA
+self.q_proj  = nn.Linear(n_embd, n_embd)
+self.kv_proj = nn.Linear(n_embd, 2 * n_kv_head * head_dim)
 ```
 
-Weight mapping from a standard nanoGPT MHA checkpoint:
+KV heads are expanded before attention via `repeat_interleave`, or computed natively with the Triton kernels (no extra allocation).
 
-| MHA weight | Shape | GQA destination | How |
-|---|---|---|---|
-| `attn.c_attn.weight` | `[3C, C]` | `q_proj.weight` | First `C` rows (Q block) |
-| `attn.c_attn.weight` | `[3C, C]` | `kv_proj.weight` | Rows `C:C+kv_dim` and `2C:2C+kv_dim` (first `n_kv_head` heads of K and V) |
-| `attn.c_proj.weight` | `[C, C]` | `c_proj.weight` | Direct copy |
-| `transformer.wpe` | — | *(discarded)* | RoPE has no learned weights |
-| All others (ln, mlp, wte, ln_f) | — | Same key | Direct copy |
+### RoPE
 
-### 4. FSDP Training (`train_fsdp.py`)
+Rotary Position Embeddings rotate Q and K vectors by a position-dependent angle instead of adding a learned embedding to the input:
+- No learned `wpe` table — zero extra parameters
+- Works correctly with KV caches by rotating at the cache offset position
+- Better length generalisation than absolute PE
 
-Supports both MHA and GQA models, single GPU and multi-GPU.
+### SwiGLU MLP
 
-**Run on multiple GPUs:**
-```bash
-torchrun --standalone --nproc_per_node=4 train_fsdp.py config/train_gpt2.py --n_kv_head=4
-```
-
-**Run on single GPU (FSDP disabled, useful for testing):**
-```bash
-~/venv/bin/python train_fsdp.py config/train_shakespeare_gqa.py
-```
-
-**All configurable parameters:**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `n_kv_head` | `0` | `0` = MHA; positive value = GQA with that many KV heads |
-| `rope_base` | `10000` | RoPE frequency base |
-| `init_from` | `scratch` | `scratch`, `resume`, or `mha_to_gqa` |
-| `dataset` | `openwebtext` | Subdirectory under `data/` |
-| `wandb_log` | `False` | Enable W&B logging |
-| `wandb_run_name` | `''` | Auto-generated if empty: e.g. `gqa4-rope10000-L12H12E768` |
-
-**`init_from` modes:**
-
-| Value | Behaviour |
-|---|---|
-| `scratch` | Train from random init |
-| `resume` | Resume from `out_dir/ckpt.pt` |
-| `mha_to_gqa` | Load MHA checkpoint, slice KV heads to `n_kv_head`, continue training |
-
-### 5. FineWeb-Edu Streaming Data Prep
-
-Streams the `sample-10BT` split of FineWeb-Edu directly from HuggingFace — no need to download the full dataset (~25GB saved).
-
-```bash
-~/venv/bin/python data/fineweb_edu/prepare.py
-```
-
-Outputs:
-- `data/fineweb_edu/train.bin` — ~17–19GB, ~10B GPT-2 BPE tokens
-- `data/fineweb_edu/val.bin` — ~8MB (first 5000 documents)
-- `data/fineweb_edu/meta.pkl` — `vocab_size=50257` for auto-discovery
-
-Then train with:
-```bash
-~/venv/bin/python train_fsdp.py --dataset=fineweb_edu --n_kv_head=4
-```
-
-### 6. Experiment Infrastructure
-
-Run multiple named configs and compare their training curves.
-
-**Available experiment configs (`config/experiments/`):**
-
-| Config | Architecture | `n_kv_head` | `rope_base` |
-|---|---|---|---|
-| `exp01_mha_abspe.py` | MHA + absolute PE (baseline) | — | — |
-| `exp02_gqa2_rope.py` | GQA + RoPE | 2 | 10000 |
-| `exp03_gqa3_rope.py` | GQA + RoPE | 3 | 10000 |
-| `exp04_mqa_rope.py` | MQA + RoPE | 1 | 10000 |
-| `exp05_gqa2_rope500k.py` | GQA + RoPE (long-ctx base) | 2 | 500000 |
-
-All experiments use the same model size (L6 H6 E384) and dataset (shakespeare_char) for fair comparison.
-
-**Run all sequentially:**
-```bash
-bash config/experiments/run_all.sh
-```
-
-**Compare results:**
-```bash
-# Print summary table
-~/venv/bin/python config/experiments/compare.py
-
-# With plot (requires matplotlib)
-~/venv/bin/python config/experiments/compare.py --plot
-```
-
-### 7. CSV Logging
-
-Every training run writes a `log.csv` to `out_dir/` automatically — no wandb required.
-
-```
-iter,train_loss,val_loss,lr,tokens_seen,run_name
-0,4.2314,4.2184,0.000010,0,exp02-gqa2-rope10k
-250,1.7828,1.9031,0.000986,1024000,exp02-gqa2-rope10k
-...
-```
-
-Load with pandas for custom analysis:
 ```python
-import pandas as pd
-df = pd.read_csv('out_experiments/exp02_gqa2_rope/log.csv')
+x = F.silu(gate_proj(x)) * up_proj(x)
+x = down_proj(x)
+```
+
+Hidden dimension is scaled to `(2/3) × 4 × n_embd` to keep parameter count equivalent to the standard MLP.
+
+---
+
+## Experiments
+
+### Exp 01 — GQA (n\_kv=4) + RoPE + SwiGLU on FineWeb-Edu (main run)
+
+**Dataset:** FineWeb-Edu 10BT (streamed from HuggingFace) | **Hardware:** 4× NVIDIA H100 80GB (FSDP)
+
+The primary training run. GPT-2 Small scale (~124M parameters) trained from scratch with all modern architecture improvements.
+
+| Param | Value |
+|-------|-------|
+| n\_layer / n\_head / n\_kv\_head / n\_embd | 12 / 12 / 4 / 768 |
+| block\_size | 1024 |
+| use\_rope | True (base=10000) |
+| use\_swiglu | True |
+| Parameters | ~124M |
+| Batch size | 48 seq × 1024 tok = 49,152 tok/step |
+| Effective batch | 16 grad accum steps × 49,152 = ~786K tok/step |
+| Optimizer | AdamW, lr=1e-3, cosine decay |
+| Warmup | 750 iters |
+| max\_iters | 40,000 (extended from 20,000 mid-run) |
+| Tokens seen at checkpoint | ~14.7B |
+| **Best val loss** | **2.9786 (perplexity ≈ 19.7)** |
+
+**Training curve (selected checkpoints):**
+
+| Iter | Train Loss | Val Loss | Tokens Seen |
+|------|-----------|---------|-------------|
+| 0 | 10.980 | 10.979 | 0 |
+| 375 | 4.894 | 4.879 | 276M |
+| 750 | 4.034 | 3.970 | 553M |
+| 1500 | 3.593 | 3.591 | 1.1B |
+| 3000 | 3.334 | 3.382 | 2.2B |
+| 6000 | 3.123 | 3.153 | 4.4B |
+| 10875 | 3.121 | 3.064 | 8.0B |
+| 15750 | 3.046 | 3.008 | 11.6B |
+| **19500** | **3.014** | **2.979** | **14.4B** |
+
+![Training loss curve](assets/loss_plot_combined.png)
+
+**Note on mid-run extension:** Training was extended from 20K to 40K iterations at step 19,500 by changing `lr_decay_iters`. The cosine schedule at step 19,500 on a 40K curve has a higher LR than the same step on a 20K curve — effectively a warm restart that can help escape sharp minima.
+
+---
+
+## KV Cache Benchmark: GQA vs MHA
+
+**Script:** `eval/bench_inference.py`
+**Hardware:** NVIDIA RTX 4070 Laptop 8GB | **Precision:** bfloat16 | **Batch:** 1
+
+Both variants use the same `model_gqa.py` codebase. MHA is instantiated as `GPTGQA(n_kv_head=n_head)` — identical code path, weights shared for all matching tensors, only KV projection shape differs. This isolates the KV head count effect from any other architectural difference.
+
+**KV cache sizes (full 1024-token context):**
+
+| Variant | KV heads | KV cache / sequence |
+|---------|----------|-------------------|
+| GQA | 4 | 12.6 MB |
+| MHA | 12 | 37.7 MB |
+| **Savings** | | **25.1 MB (3.0× smaller)** |
+
+**Results at prompt\_len=512:**
+
+| Metric | GQA (n\_kv=4) | MHA (n\_head=12) |
+|--------|--------------|-----------------|
+| TTFT (ms) | ~14 ms | ~14 ms |
+| Prefill TPS | ~35,000 | ~35,000 |
+| Decode TPT (ms/tok) | ~9.1 ms | ~9.5 ms |
+| Decode TPS | ~110 | ~105 |
+| VRAM prefill (MB) | ~1090 | ~1120 |
+| VRAM decode (MB) | ~1100 | ~1135 |
+
+![Decode tokens per second](assets/bench_inference_decode_tps.png)
+
+![Time per decode token](assets/bench_inference_decode_tpt.png)
+
+![VRAM during decode](assets/bench_inference_vram_decode.png)
+
+![GQA vs MHA speedup](assets/bench_inference_speedup_bar.png)
+
+**Key takeaways:**
+- **Prefill latency is identical** — compute-bound, not KV-size-bound
+- **Decode TPS ~5% higher for GQA** — fewer KV tensors = less memory bandwidth per step
+- **VRAM ~30–40 MB lower for GQA** — exactly the KV cache size difference
+- At larger batch sizes and longer contexts the gap widens; production systems (LLaMA 2/3, Mistral) report 20–50% decode speedup from GQA
+
+---
+
+## Triton GQA Kernels
+
+`triton_kernels_gqa.py` implements native GQA attention without `repeat_interleave`.
+
+The default `repeat_interleave` approach allocates a full `(B, n_head, T, head_dim)` tensor for K and V before passing to SDPA — storing `n_groups×` more data than necessary. The Triton kernels operate on unexpanded K/V directly:
+
+```
+triton_gqa_prefill(q, k, v):
+    Q: (B, n_head,    T, head_dim)
+    K: (B, n_kv_head, T, head_dim)   # NOT expanded
+    V: (B, n_kv_head, T, head_dim)
+
+    Each block handles one (batch, q_head, BLOCK_M query rows)
+    kv_head = q_head // n_groups  (computed inside kernel)
+    Online softmax (Flash Attention style), BLOCK_M=64, BLOCK_N=32
+
+triton_gqa_decode(q, k, v):
+    Q: (B, n_head,    1, head_dim)    # single new token
+    K: (B, n_kv_head, S, head_dim)   # full KV cache
+    One program per (batch, q_head), attends across all S cached positions
 ```
 
 ---
 
-## Quick Start
+## Running
 
-**1. Validate GQA implementation (Shakespeare char, ~5 min):**
 ```bash
-~/venv/bin/python data/shakespeare_char/prepare.py
-~/venv/bin/python train_fsdp.py config/train_shakespeare_gqa.py
-```
+# Reproduce exp15 on 4× H100:
+torchrun --standalone --nproc_per_node=4 train_fsdp.py \
+    config/experiments/exp15_gqa4_swiglu_lr1e3_fineweb_4gpu.py
 
-**2. Run all architecture comparison experiments (~15 min total):**
-```bash
-bash config/experiments/run_all.sh
-~/venv/bin/python config/experiments/compare.py --plot
-```
+# Generate text from checkpoint:
+python eval/sample_gqa.py \
+    --ckpt_path=/path/to/ckpt.pt \
+    --num_samples=5 --max_new_tokens=200
 
-**3. Train GQA on FineWeb-Edu (stream data, then train):**
-```bash
-# Step 1: stream and tokenize (~1–3 hrs, network-bound)
-~/venv/bin/python data/fineweb_edu/prepare.py
+# Run KV cache benchmark:
+python eval/bench_inference.py \
+    --ckpt_path=/path/to/ckpt.pt
 
-# Step 2: train GQA model
-~/venv/bin/python train_fsdp.py \
-  --dataset=fineweb_edu \
-  --n_kv_head=4 \
-  --n_layer=12 --n_head=12 --n_embd=768 \
-  --out_dir=out_fineweb_gqa
-```
-
-**4. Convert an existing MHA checkpoint to GQA:**
-```bash
-~/venv/bin/python train_fsdp.py \
-  --init_from=mha_to_gqa \
-  --n_kv_head=4 \
-  --out_dir=out_mha_run \
-  --out_dir=out_gqa_finetuned
+# Plot training curve:
+python eval/plot_loss.py \
+    --log_csv=/path/to/log.csv
 ```
 
 ---
 
-## Original nanoGPT
+## References
 
-The original nanoGPT code (`model.py`, `train.py`, `sample.py`) is preserved unchanged. All additions are additive — `model_gqa.py` and `train_fsdp.py` are separate files and do not modify the original training path.
-
-For the original README and usage, see the [upstream repo](https://github.com/karpathy/nanoGPT).
+- [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245) — Ainslie et al., 2023
+- [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864) — Su et al., 2021
+- [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) — Shazeer, 2020
+- [Flash Attention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135) — Dao et al., 2022
+- [nanoGPT](https://github.com/karpathy/nanoGPT) — Andrej Karpathy
+- [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — HuggingFace

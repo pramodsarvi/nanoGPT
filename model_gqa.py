@@ -25,12 +25,19 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 try:
     from triton_kernels import triton_layernorm, triton_layernorm_residual, TritonGELU, triton_gelu_bias
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+
+try:
+    from triton_kernels_gqa import triton_gqa_prefill, triton_gqa_decode
+    HAS_TRITON_GQA = True
+except ImportError:
+    HAS_TRITON_GQA = False
 
 
 # -----------------------------------------------------------------------------
@@ -142,8 +149,9 @@ class GQACausalSelfAttention(nn.Module):
         self.attn_dropout  = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
+        self.use_triton_attn = getattr(config, 'use_triton_attn', False) and HAS_TRITON_GQA
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
+        if not self.flash and not self.use_triton_attn:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             self.register_buffer(
                 "bias",
@@ -178,24 +186,33 @@ class GQACausalSelfAttention(nn.Module):
             v = torch.cat([prev_v, v], dim=2)
         kv_cache = (k, v)
 
-        # Expand KV heads: (B, n_kv_head, S, hs) -> (B, n_head, S, hs)
-        k_expanded = k.repeat_interleave(self.n_groups, dim=1)
-        v_expanded = v.repeat_interleave(self.n_groups, dim=1)
-
-        if self.flash:
-            y = F.scaled_dot_product_attention(
-                q, k_expanded, v_expanded,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_first_pass,
-            )
-        else:
-            att = (q @ k_expanded.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        if self.use_triton_attn:
+            # Triton GQA kernels: operate on un-expanded K/V — no repeat_interleave needed
             if is_first_pass:
-                att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v_expanded
+                # prefill: full causal sequence
+                y = triton_gqa_prefill(q, k, v)
+            else:
+                # decode: single new token vs full KV cache
+                y = triton_gqa_decode(q, k, v)
+        else:
+            # Expand KV heads: (B, n_kv_head, S, hs) -> (B, n_head, S, hs)
+            k_expanded = k.repeat_interleave(self.n_groups, dim=1)
+            v_expanded = v.repeat_interleave(self.n_groups, dim=1)
+
+            if self.flash:
+                y = F.scaled_dot_product_attention(
+                    q, k_expanded, v_expanded,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=is_first_pass,
+                )
+            else:
+                att = (q @ k_expanded.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+                if is_first_pass:
+                    att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v_expanded
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -279,8 +296,10 @@ class GPTConfigGQA:
     bias:        bool  = True
     use_triton:  bool  = False
     rope_base:   int   = 10000   # RoPE frequency base (10000 = original, 500000 = LLaMA 3)
-    use_rope:    bool  = True    # False = use learned absolute PE (compatible with GPT-2 pretrained weights)
-    use_swiglu:  bool  = False   # True = SwiGLU MLP (LLaMA-style); False = GELU (GPT-2 style)
+    use_rope:       bool  = True    # False = use learned absolute PE (compatible with GPT-2 pretrained weights)
+    use_swiglu:     bool  = False   # True = SwiGLU MLP (LLaMA-style); False = GELU (GPT-2 style)
+    gradient_checkpointing: bool = False  # recompute activations on backward to save memory
+    use_triton_attn: bool = False   # True = use custom Triton GQA kernels instead of SDPA
 
 
 class GPTGQA(nn.Module):
@@ -358,7 +377,12 @@ class GPTGQA(nn.Module):
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
             block_kv_cache = kv_caches[i] if kv_caches is not None else None
-            x, new_block_kv_cache = block(x, rope=rope, kv_cache=block_kv_cache)
+            if self.config.gradient_checkpointing and self.training and block_kv_cache is None:
+                # grad checkpoint: recompute activations during backward to save memory.
+                # Not compatible with KV cache (inference only), so only applied during training.
+                x, new_block_kv_cache = grad_checkpoint(block, x, rope, None, use_reentrant=False)
+            else:
+                x, new_block_kv_cache = block(x, rope=rope, kv_cache=block_kv_cache)
             new_kv_caches.append(new_block_kv_cache)
 
         x = self.transformer.ln_f(x)
