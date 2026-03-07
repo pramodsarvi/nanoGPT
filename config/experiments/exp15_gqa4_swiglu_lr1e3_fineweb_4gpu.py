@@ -21,9 +21,9 @@ n_layer    = 12
 n_head     = 12
 n_embd     = 768
 block_size = 1024
-batch_size = 72                   # Increased to 80 for better 80GB memory utilization
-gradient_accumulation_steps = 10  # 10 * 80 * 1024 = 819,200 (Roughly same effective batch)
-                                  # divisible by 2 GPUs → 5 accum steps per GPU
+batch_size = 48                   # Lowered to 48 to prevent OOMs over long runs
+gradient_accumulation_steps = 16  # 16 * 48 * 1024 = 786,432 (Original effective batch size)
+                                  # divisible by 2 GPUs → 8 accum steps per GPU
 hf_prefetch_batches  = 128         # Lowered from 256 to reduce CPU/pinned RAM usage
 hf_tokenizer_threads = 8          # Keep at 1 to avoid redundant dataloader RAM usage
 dropout    = 0.0
@@ -33,6 +33,7 @@ compile    = True
 # Total tokens ≈ 786K × 11250 ≈ 8.85B (matches exp14's 590K × 15000 ≈ 8.85B)
 max_iters      = 20000
 eval_interval  = 375              # ~same number of evals as exp14 (15000/500 = 30, 11250/375 = 30)
+eval_iters     = 20               # Run 20 batches per eval instead of default 100 to save time & memory
 warmup_iters   = 750              # same fraction as exp14 (1000/15000 ≈ 750/11250 ≈ 6.7%)
 learning_rate  = 1e-3
 min_lr         = 1e-4             # 10x decay
