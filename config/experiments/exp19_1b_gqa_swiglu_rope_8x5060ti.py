@@ -39,8 +39,8 @@ dataset = 'hf:HuggingFaceFW/fineweb-edu@sample-350BT'
 
 # RTX 5060 Ti has fast PCIe but less memory bandwidth than A100;
 # moderate prefetch to avoid host RAM pressure across 8 processes
-hf_prefetch_batches  = 64
-hf_tokenizer_threads = 4
+hf_prefetch_batches  = 128
+hf_tokenizer_threads = 8
 
 # ── Model — identical to exp17 ────────────────────────────────────────────────
 n_layer    = 24
