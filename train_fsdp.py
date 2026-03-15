@@ -298,7 +298,7 @@ if init_from == 'scratch':
 
 elif init_from in ('resume', 'weights_only'):
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     checkpoint_model_args = checkpoint['model_args']
     resume_keys = ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']
     if use_gqa:

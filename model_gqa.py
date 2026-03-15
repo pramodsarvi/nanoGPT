@@ -493,7 +493,7 @@ class GPTGQA(nn.Module):
         override_args = override_args or {}
 
         print(f"Loading MHA checkpoint from {ckpt_path} ...")
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         mha_args = checkpoint['model_args']
 
         config_fields = dict(
